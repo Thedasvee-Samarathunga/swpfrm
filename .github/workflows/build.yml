@@ -1,0 +1,148 @@
+name: Build Swapframe
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.12'
+  FONT_URL: https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install -r requirements.txt
+      - name: Engine tests
+        run: python tests/test_engine.py
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-14
+            name: macos-arm64
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Linux Qt runtime libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+            libxcb-xfixes0 libdbus-1-3 libfontconfig1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "pyinstaller>=6.6"
+
+      - name: Fetch Montserrat
+        shell: bash
+        continue-on-error: true
+        run: |
+          mkdir -p assets/fonts
+          curl -fsSL -o "assets/fonts/Montserrat.ttf" "$FONT_URL"
+
+      - name: Build (PyInstaller)
+        shell: bash
+        run: |
+          ICON=assets/icon.png
+          [ "$RUNNER_OS" = "Windows" ] && ICON=assets/icon.ico
+          [ "$RUNNER_OS" = "macOS" ] && ICON=assets/icon.icns
+          pyinstaller app.py \
+            --name Swapframe \
+            --windowed \
+            --noconfirm \
+            --clean \
+            --icon "$ICON" \
+            --add-data "assets:assets" \
+            --collect-all onnxruntime \
+            --collect-all imageio_ffmpeg \
+            --collect-submodules onnx \
+            --hidden-import certifi \
+            --exclude-module tkinter \
+            --exclude-module matplotlib \
+            --osx-bundle-identifier app.swapframe
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Swapframe\Swapframe.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Smoke test failed with exit code $($p.ExitCode)" }
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        run: ./dist/Swapframe.app/Contents/MacOS/Swapframe --smoke-test
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ./dist/Swapframe/Swapframe --smoke-test
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\Swapframe\* -DestinationPath Swapframe-${{ matrix.name }}.zip
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - dist/Swapframe.app
+          ditto -c -k --keepParent dist/Swapframe.app Swapframe-${{ matrix.name }}.zip
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf Swapframe-${{ matrix.name }}.tar.gz -C dist Swapframe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Swapframe-${{ matrix.name }}
+          path: Swapframe-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
