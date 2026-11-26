@@ -1,9 +1,9 @@
-"""Face swap engine: detection, landmarks, recognition, swapping, masking, colour, enhancement.
+"""Face swap engine: detection, landmarks, recognition, swapping, expression, masking, colour, enhancement.
 
 Pre/post-processing mirrors FaceFusion's reference implementation for the
-HyperSwap / InSwapper / GFPGAN / GPEN / XSeg / BiSeNet / 2DFAN4 ONNX models.
-AlphaFace's input conventions are detected automatically the first time it is
-used (see ``calibrate``) and cached, so the app adapts to the exported model.
+HyperSwap / InSwapper / LivePortrait / GFPGAN / GPEN / XSeg / BiSeNet / 2DFAN4
+ONNX models. AlphaFace's input conventions are detected automatically the first
+time it is used (see ``calibrate``) and cached.
 """
 from __future__ import annotations
 
@@ -106,6 +106,25 @@ def match_colour(swapped: np.ndarray, target: np.ndarray, mask: np.ndarray, stre
     out = (src - s_mean) * ratio + r_mean
     out = src + (out - src) * float(strength)
     return cv2.cvtColor(out.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+
+
+def rotation_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
+    """Extrinsic x-y-z Euler rotation in degrees (same as scipy ``from_euler('xyz', ..., degrees=True)``)."""
+    p, y, r = np.radians([pitch, yaw, roll])
+    rx = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
+    ry = np.array([[np.cos(y), 0, np.sin(y)], [0, 1, 0], [-np.sin(y), 0, np.cos(y)]])
+    rz = np.array([[np.cos(r), -np.sin(r), 0], [np.sin(r), np.cos(r), 0], [0, 0, 1]])
+    return (rz @ ry @ rx).astype(np.float32)
+
+
+def _angle(value: np.ndarray) -> float:
+    """Head angle in degrees; also accepts LivePortrait's raw 66-bin logits."""
+    v = np.asarray(value, np.float32).reshape(-1)
+    if v.size >= 66:
+        e = np.exp(v - v.max())
+        prob = e / e.sum()
+        return float((prob * np.arange(v.size)).sum() * 3 - 97.5)
+    return float(v[0])
 
 
 # --------------------------------------------------------------------------- #
@@ -253,15 +272,15 @@ class Detector:
 
 def _unrotate(pts: np.ndarray, code: int, w: int, h: int) -> np.ndarray:
     x, y = pts[:, 0], pts[:, 1]
-    if code == cv2.ROTATE_90_CLOCKWISE:        # rotated (h x w): x' = h-1-y, y' = x
+    if code == cv2.ROTATE_90_CLOCKWISE:
         return np.stack([y, h - 1 - x], axis=1)
-    if code == cv2.ROTATE_90_COUNTERCLOCKWISE:  # x' = y, y' = w-1-x
+    if code == cv2.ROTATE_90_COUNTERCLOCKWISE:
         return np.stack([w - 1 - y, x], axis=1)
     return np.stack([w - 1 - x, h - 1 - y], axis=1)
 
 
 class Landmarker:
-    """2DFAN4 68-point landmarks -> refined 5-point alignment (much steadier on turned heads + expressions)."""
+    """2DFAN4 68-point landmarks -> refined 5-point alignment (steadier on turned heads + expressions)."""
 
     def __init__(self, session: ort.InferenceSession):
         self.session = session
@@ -326,6 +345,7 @@ KNOWN = {
 }
 AUTO = {'alphaface_256'}  # conventions detected on first use
 SWAPPER_KEYS = list(KNOWN) + sorted(AUTO)
+EXPRESSION_MODELS = ('live_portrait_feature_extractor', 'live_portrait_motion_extractor', 'live_portrait_generator')
 
 
 def find_emap(path: str) -> Optional[np.ndarray]:
@@ -386,6 +406,69 @@ class Swapper:
         return explode_pixel_boost([self._run(t, embedding) for t in tiles], total, self.size)
 
 
+class ExpressionRestorer:
+    """LivePortrait: re-animates the swapped face with the original target expression.
+
+    Mirrors FaceFusion's expression_restorer: the motion extractor reads the expression of the
+    original face and of the swapped face, the generator re-renders the swapped face's appearance
+    with the original's expression (eyes, brows, mouth), while head pose comes from the swap.
+    """
+    SIZE = 512                       # crop size (arcface_128 template)
+    KEEP_FROM_SWAP = [0, 4, 5, 8, 9]  # keypoints that stay with the swapped face (FaceFusion)
+
+    def __init__(self, feature, motion, generator):
+        self.feature, self.motion, self.generator = feature, motion, generator
+        self.f_in = feature.get_inputs()[0].name
+        self.m_in = motion.get_inputs()[0].name
+        names = [i.name for i in generator.get_inputs()]
+        if {'feature_volume', 'source', 'target'} <= set(names):
+            self.g_names = ('feature_volume', 'source', 'target')
+        else:
+            self.g_names = tuple(names[:3])
+
+    @staticmethod
+    def _prepare(crop: np.ndarray) -> np.ndarray:
+        half = ExpressionRestorer.SIZE // 2
+        x = cv2.resize(crop, (half, half), interpolation=cv2.INTER_AREA)[:, :, ::-1].astype(np.float32) / 255.0
+        return x.transpose(2, 0, 1)[None].astype(np.float32)
+
+    def _motion(self, x: np.ndarray):
+        pitch, yaw, roll, scale, translation, expression, points = self.motion.run(None, {self.m_in: x})[:7]
+        expression = np.asarray(expression, np.float32).reshape(1, -1, 3)
+        points = np.asarray(points, np.float32).reshape(1, -1, 3)
+        scale = np.asarray(scale, np.float32).reshape(-1)[0]
+        translation = np.asarray(translation, np.float32).reshape(-1)[:3].copy()
+        if translation.size == 3:
+            translation[2] = 0.0  # LivePortrait only translates in x/y
+        else:
+            translation = np.pad(translation, (0, 3 - translation.size))
+        return _angle(pitch), _angle(yaw), _angle(roll), scale, translation, expression, points
+
+    def restore(self, original_crop: np.ndarray, swapped_crop: np.ndarray, factor: float) -> np.ndarray:
+        """Both crops are BGR SIZE x SIZE aligned with the arcface_128 template. Returns BGR float32."""
+        src = self._prepare(original_crop)
+        tgt = self._prepare(swapped_crop)
+        volume = self.feature.run(None, {self.f_in: tgt})[0]
+        original_expression = self._motion(src)[5]
+        pitch, yaw, roll, scale, translation, swapped_expression, points = self._motion(tgt)
+        rot = rotation_matrix(pitch, yaw, roll)
+        expression = original_expression.copy()
+        expression[:, self.KEEP_FROM_SWAP] = swapped_expression[:, self.KEEP_FROM_SWAP]
+        expression = expression * factor + swapped_expression * (1 - factor)
+        # keep it plausible: never push a keypoint wildly further than either face did
+        expression = np.clip(expression, np.minimum(original_expression, swapped_expression) - 0.05,
+                             np.maximum(original_expression, swapped_expression) + 0.05)
+        base = points @ rot.T
+        source_points = (scale * (base + expression) + translation).astype(np.float32)
+        target_points = (scale * (base + swapped_expression) + translation).astype(np.float32)
+        out = self.generator.run(None, {self.g_names[0]: volume, self.g_names[1]: source_points,
+                                        self.g_names[2]: target_points})[0][0]
+        out = out.astype(np.float32).transpose(1, 2, 0).clip(0, 1)[:, :, ::-1] * 255.0
+        if out.shape[0] != self.SIZE:
+            out = cv2.resize(out, (self.SIZE, self.SIZE), interpolation=cv2.INTER_CUBIC)
+        return out
+
+
 class Occluder:
     """XSeg occlusion mask: keeps hands, hair, glasses etc. in front of the new face."""
 
@@ -419,7 +502,6 @@ class FaceParser:
         x = ((x - self.MEAN) / self.STD).transpose(2, 0, 1)[None]
         out = self.session.run(None, {self.input_name: x})[0][0]
         region = np.isin(out.argmax(0), self.REGIONS).astype(np.float32)
-        # grow slightly so the jawline / forehead blend instead of cutting hard
         region = cv2.dilate(region, np.ones((9, 9), np.uint8))
         region = cv2.resize(region, crop.shape[:2][::-1])
         return (cv2.GaussianBlur(region.clip(0, 1), (0, 0), 5).clip(0.5, 1) - 0.5) * 2
@@ -500,6 +582,7 @@ def calibrate(session, emap, frame: np.ndarray, target: Face, source: Sequence[F
 class Settings:
     swapper: str = 'alphaface_256'
     boost: int = 2                      # pixel boost multiplier (1, 2, 4)
+    expression: float = 0.0             # 0 = off, 1 = fully the target's original expression
     enhancer: Optional[str] = None      # 'gfpgan_1.4' | 'gpen_bfr_512' | None
     enhance_blend: float = 0.8
     occlusion: bool = False
@@ -564,6 +647,8 @@ class Pipeline:
         keys = ['retinaface_10g', 'arcface_w600k_r50', settings.swapper]
         if settings.landmarks:
             keys.append('2dfan4')
+        if settings.expression > 0:
+            keys.extend(EXPRESSION_MODELS)
         if settings.enhancer:
             keys.append(settings.enhancer)
         if settings.occlusion:
@@ -699,6 +784,8 @@ class Pipeline:
             embedding = swapper.source_embedding(source)
             occluder = Occluder(self._session('xseg_1')) if settings.occlusion else None
             parser = FaceParser(self._session('bisenet_resnet_34')) if settings.face_shape else None
+            restorer = ExpressionRestorer(*(self._session(k) for k in EXPRESSION_MODELS)) \
+                if settings.expression > 0 else None
             enhancer = Enhancer(self._session(settings.enhancer)) if settings.enhancer else None
 
             out = frame.copy()
@@ -715,9 +802,26 @@ class Pipeline:
                 if settings.colour_match > 0:
                     swapped = match_colour(swapped, crop, mask, settings.colour_match)
                 paste_back(out, swapped, mask, matrix)
+                if restorer is not None:
+                    self._restore_expression(restorer, frame, out, face, settings, parser, occluder)
                 if enhancer is not None:
                     enhancer.enhance(out, face, settings.enhance_blend)
             return out
+
+    def _restore_expression(self, restorer: ExpressionRestorer, original: np.ndarray, out: np.ndarray,
+                            face: Face, settings: Settings, parser, occluder) -> None:
+        size = ExpressionRestorer.SIZE
+        original_crop, _ = warp_face(original, face.kps, 'arcface_128', size)
+        swapped_crop, matrix = warp_face(out, face.kps, 'arcface_128', size)
+        restored = restorer.restore(original_crop, swapped_crop, min(1.2, settings.expression * 1.2))
+        mask = self._crop_mask(size, settings)
+        if parser is not None:
+            mask = np.minimum(mask, parser.mask(original_crop))
+        if occluder is not None:
+            mask = np.minimum(mask, occluder.mask(original_crop))
+        if settings.colour_match > 0:
+            restored = match_colour(restored, swapped_crop, mask, 1.0)
+        paste_back(out, restored, mask, matrix)
 
     @staticmethod
     def _select(faces: List[Face], settings: Settings) -> List[Face]:

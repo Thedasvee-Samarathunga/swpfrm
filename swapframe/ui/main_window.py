@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.colors = colors
         self.setWindowTitle('Swapframe')
-        self.resize(1320, 860)
+        self.resize(1320, 880)
         self.setMinimumSize(1000, 680)
         self.store = QSettings('Swapframe', 'Swapframe')
 
@@ -186,6 +186,19 @@ class MainWindow(QMainWindow):
         self.detail.changed.connect(self._settings_changed)
         side.addWidget(self.detail)
 
+        # expression
+        side.addWidget(section('Expression'))
+        xrow = QHBoxLayout()
+        self.expr_switch = self._switch('Keep target expression',
+                                        "Copies the original smile, eyes, brows and mouth back onto the new face")
+        self.expr_slider = QSlider(Qt.Orientation.Horizontal, minimum=10, maximum=100, value=80)
+        self.expr_slider.setToolTip('How strongly to copy the original expression')
+        self.expr_slider.setFixedWidth(90)
+        self.expr_slider.sliderReleased.connect(self._settings_changed)
+        xrow.addWidget(self.expr_switch, 1)
+        xrow.addWidget(self.expr_slider)
+        side.addLayout(xrow)
+
         side.addWidget(section('Enhance'))
         erow = QHBoxLayout()
         self.enh_box = QComboBox()
@@ -292,12 +305,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ settings --
     def _load_settings(self):
         s = self.store
-        widgets = (self.model_box, self.enh_box, self.enh_slider, self.shape_switch, self.tone_switch,
-                   self.lm_switch, self.occl_switch, self.steady_switch)
+        widgets = (self.model_box, self.enh_box, self.enh_slider, self.expr_switch, self.expr_slider,
+                   self.shape_switch, self.tone_switch, self.lm_switch, self.occl_switch, self.steady_switch)
         for w in widgets:
             w.blockSignals(True)
         self.model_box.setCurrentIndex(max(0, self.model_box.findData(s.value('swapper', 'alphaface_256'))))
         self.detail.set_index(int(s.value('detail', 1)))
+        self.expr_switch.setChecked(_bool(s.value('expression_on', True)))
+        self.expr_slider.setValue(int(s.value('expression', 80)))
         self.enh_box.setCurrentIndex(max(0, self.enh_box.findData(s.value('enhancer', None) or None)))
         self.enh_slider.setValue(int(s.value('enhance_blend', 80)))
         self.shape_switch.setChecked(_bool(s.value('face_shape', True)))
@@ -307,12 +322,14 @@ class MainWindow(QMainWindow):
         self.steady_switch.setChecked(_bool(s.value('stabilise', True)))
         for w in widgets:
             w.blockSignals(False)
-        self.enh_slider.setEnabled(self.enh_box.currentData() is not None)
+        self._sync_sliders()
 
     def _save_settings(self):
         s = self.store
         s.setValue('swapper', self.model_box.currentData())
         s.setValue('detail', self.detail.index())
+        s.setValue('expression_on', self.expr_switch.isChecked())
+        s.setValue('expression', self.expr_slider.value())
         s.setValue('enhancer', self.enh_box.currentData() or '')
         s.setValue('enhance_blend', self.enh_slider.value())
         s.setValue('face_shape', self.shape_switch.isChecked())
@@ -322,10 +339,15 @@ class MainWindow(QMainWindow):
         s.setValue('stabilise', self.steady_switch.isChecked())
         s.setValue('device', self.device_box.currentData())
 
+    def _sync_sliders(self):
+        self.enh_slider.setEnabled(self.enh_box.currentData() is not None)
+        self.expr_slider.setEnabled(self.expr_switch.isChecked())
+
     def settings(self) -> Settings:
         return Settings(
             swapper=self.model_box.currentData(),
             boost=DETAIL[self.detail.index()][1],
+            expression=self.expr_slider.value() / 100.0 if self.expr_switch.isChecked() else 0.0,
             enhancer=self.enh_box.currentData(),
             enhance_blend=self.enh_slider.value() / 100.0,
             occlusion=self.occl_switch.isChecked(),
@@ -338,7 +360,7 @@ class MainWindow(QMainWindow):
         )
 
     def _settings_changed(self, *_):
-        self.enh_slider.setEnabled(self.enh_box.currentData() is not None)
+        self._sync_sliders()
         self._save_settings()
         self._schedule_preview()
 
@@ -773,10 +795,15 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def _set_controls_enabled(self, on: bool):
-        for w in (self.src_drop, self.tgt_drop, self.model_box, self.detail, self.enh_box, self.enh_slider,
+        for w in (self.src_drop, self.tgt_drop, self.model_box, self.detail, self.expr_switch, self.enh_box,
                   self.face_box, self.shape_switch, self.tone_switch, self.lm_switch, self.occl_switch,
                   self.steady_switch, self.device_box, self.scrub, self.strip):
             w.setEnabled(on)
+        if on:
+            self._sync_sliders()
+        else:
+            self.expr_slider.setEnabled(False)
+            self.enh_slider.setEnabled(False)
         self.preview.setAcceptDrops(on)
 
     def _reveal_last(self):

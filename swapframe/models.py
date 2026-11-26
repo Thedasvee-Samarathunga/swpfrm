@@ -41,6 +41,12 @@ MODELS: dict[str, ModelInfo] = {m.key: m for m in [
     ModelInfo('hyperswap_1b_256', 'models-3.3.0', 'hyperswap_1b_256.onnx', 'HyperSwap 1B'),
     ModelInfo('hyperswap_1c_256', 'models-3.3.0', 'hyperswap_1c_256.onnx', 'HyperSwap 1C'),
     ModelInfo('inswapper_128_fp16', 'models-3.0.0', 'inswapper_128_fp16.onnx', 'InSwapper 128'),
+    # expression restorer (LivePortrait)
+    ModelInfo('live_portrait_feature_extractor', 'models-3.0.0', 'live_portrait_feature_extractor.onnx',
+              'Expression model 1/3'),
+    ModelInfo('live_portrait_motion_extractor', 'models-3.0.0', 'live_portrait_motion_extractor.onnx',
+              'Expression model 2/3'),
+    ModelInfo('live_portrait_generator', 'models-3.0.0', 'live_portrait_generator.onnx', 'Expression model 3/3'),
     # enhancers
     ModelInfo('gfpgan_1.4', 'models-3.0.0', 'gfpgan_1.4.onnx', 'GFPGAN 1.4'),
     ModelInfo('gpen_bfr_512', 'models-3.0.0', 'gpen_bfr_512.onnx', 'GPEN 512'),
@@ -76,7 +82,7 @@ def is_downloaded(key: str) -> bool:
 
 
 def _open(url: str, timeout: int = 30):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Swapframe/1.1'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'Swapframe/1.2'})
     return urllib.request.urlopen(req, timeout=timeout, context=_SSL)
 
 
