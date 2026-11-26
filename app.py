@@ -2,13 +2,11 @@
 import os
 import sys
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication, QIcon, QPalette
+from PySide6.QtGui import QFontDatabase, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from swapframe import __version__
 from swapframe.ui.main_window import MainWindow
-from swapframe.ui.style import DARK, LIGHT, stylesheet
 
 
 def resource(*parts: str) -> str:
@@ -29,13 +27,6 @@ def load_font() -> str:
     if family:
         return family
     return 'Segoe UI' if sys.platform == 'win32' else 'Sans Serif'
-
-
-def is_dark(app: QApplication) -> bool:
-    try:
-        return QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
-    except Exception:
-        return app.palette().color(QPalette.ColorRole.Window).lightness() < 128
 
 
 def _redirect_logs() -> None:
@@ -64,20 +55,7 @@ def main() -> int:
     if os.path.exists(icon):
         app.setWindowIcon(QIcon(icon))
 
-    colors = DARK if is_dark(app) else LIGHT
-    pal = app.palette()
-    pal.setColor(QPalette.ColorRole.Window, QColor(colors['bg']))
-    pal.setColor(QPalette.ColorRole.WindowText, QColor(colors['text']))
-    pal.setColor(QPalette.ColorRole.Base, QColor(colors['panel']))
-    pal.setColor(QPalette.ColorRole.Text, QColor(colors['text']))
-    pal.setColor(QPalette.ColorRole.Button, QColor(colors['sunken']))
-    pal.setColor(QPalette.ColorRole.ButtonText, QColor(colors['text']))
-    pal.setColor(QPalette.ColorRole.Highlight, QColor(colors['accent']))
-    app.setPalette(pal)
-    family = load_font()
-    app.setStyleSheet(stylesheet(colors, family))
-
-    win = MainWindow(colors, family)
+    win = MainWindow(load_font())   # applies the saved theme
     win.show()
 
     if smoke:  # CI: prove the bundle starts (Qt + onnxruntime + onnx + ffmpeg), then quit

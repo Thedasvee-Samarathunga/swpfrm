@@ -12,13 +12,15 @@ import os
 import threading
 from dataclasses import dataclass, field
 from itertools import product
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 
 from . import models
+
+SkinStats = Tuple[np.ndarray, np.ndarray]  # (LAB mean, LAB std)
 
 # --------------------------------------------------------------------------- #
 # Geometry
@@ -108,6 +110,78 @@ def match_colour(swapped: np.ndarray, target: np.ndarray, mask: np.ndarray, stre
     return cv2.cvtColor(out.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
 
 
+# --------------------------------------------------------------------------- #
+# Skin tone (body matching)
+# --------------------------------------------------------------------------- #
+def skin_gate(bgr: np.ndarray) -> np.ndarray:
+    """Soft YCrCb skin likelihood (wide enough for every skin tone)."""
+    ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+    cr, cb = ycc[..., 1], ycc[..., 2]
+    g = np.clip((cr - 128) / 10, 0, 1) * np.clip((185 - cr) / 10, 0, 1)
+    g *= np.clip((cb - 70) / 10, 0, 1) * np.clip((140 - cb) / 10, 0, 1)
+    return g.astype(np.float32)
+
+
+def skin_stats(crop: np.ndarray, skin_mask: Optional[np.ndarray] = None) -> Optional[SkinStats]:
+    """LAB mean/std of the skin in an aligned face crop. Falls back to cheeks/forehead + colour gate."""
+    size = crop.shape[0]
+    if skin_mask is None:
+        skin_mask = np.zeros((size, size), np.float32)
+        s = size
+        skin_mask[int(s * .18):int(s * .34), int(s * .30):int(s * .70)] = 1   # forehead
+        skin_mask[int(s * .50):int(s * .66), int(s * .18):int(s * .34)] = 1   # left cheek
+        skin_mask[int(s * .50):int(s * .66), int(s * .66):int(s * .82)] = 1   # right cheek
+        skin_mask *= skin_gate(crop) > 0.5
+    pick = skin_mask > 0.5
+    if pick.sum() < 50:
+        return None
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).astype(np.float32)[pick]
+    # trim highlights / shadows so specular spots and beards don't skew the tone
+    lo, hi = np.percentile(lab[:, 0], [10, 90])
+    lab = lab[(lab[:, 0] >= lo) & (lab[:, 0] <= hi)]
+    if len(lab) < 30:
+        return None
+    return lab.mean(0), lab.std(0) + 1e-3
+
+
+def average_stats(stats: Sequence[Optional[SkinStats]]) -> Optional[SkinStats]:
+    stats = [s for s in stats if s is not None]
+    if not stats:
+        return None
+    return np.mean([s[0] for s in stats], 0), np.mean([s[1] for s in stats], 0)
+
+
+def tone_body(frame: np.ndarray, face: 'Face', target: SkinStats, source: SkinStats, strength: float) -> None:
+    """Recolour the target person's visible skin (neck, ears, arms, hands) toward the source face's skin tone.
+    Works in place on ``frame``; only pixels that look like *this person's* skin are moved."""
+    h, w = frame.shape[:2]
+    fw = max(face.bbox[2] - face.bbox[0], 8.0)
+    fh = max(face.bbox[3] - face.bbox[1], 8.0)
+    cx = (face.bbox[0] + face.bbox[2]) / 2
+    x0, x1 = int(max(0, cx - fw * 4)), int(min(w, cx + fw * 4))
+    y0, y1 = int(max(0, face.bbox[1] - fh * 0.6)), h
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return
+    roi = frame[y0:y1, x0:x1]
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    t_mean, t_std = target
+    s_mean, _ = source
+    z_ab = (lab[..., 1:] - t_mean[1:]) / np.maximum(t_std[1:] * 1.8, 4.0)
+    z_l = (lab[..., 0] - t_mean[0]) / max(t_std[0] * 2.5, 28.0)
+    weight = np.exp(-0.5 * ((z_ab ** 2).sum(-1) + z_l ** 2))
+    weight *= cv2.GaussianBlur(skin_gate(roi), (0, 0), 2)
+    weight = cv2.morphologyEx(weight, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    weight = cv2.GaussianBlur(weight, (0, 0), max(1.0, fw * 0.02)).clip(0, 1)[..., None]
+
+    shift = s_mean - t_mean
+    shift[0] = np.clip(shift[0], -40, 40)
+    shift[1:] = np.clip(shift[1:], -25, 25)
+    out = lab + weight * float(strength) * shift
+    toned = cv2.cvtColor(out.clip(0, 255).round().astype(np.uint8), cv2.COLOR_LAB2BGR)
+    touch = weight[..., 0] * float(strength) > 0.01   # untouched pixels skip the LAB round trip entirely
+    roi[touch] = toned[touch]
+
+
 def rotation_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
     """Extrinsic x-y-z Euler rotation in degrees (same as scipy ``from_euler('xyz', ..., degrees=True)``)."""
     p, y, r = np.radians([pitch, yaw, roll])
@@ -175,6 +249,7 @@ class Face:
     embedding: Optional[np.ndarray] = None   # raw arcface embedding (512,)
     normed: Optional[np.ndarray] = None      # L2-normalised embedding
     landmarks68: Optional[np.ndarray] = None
+    crop: Optional[np.ndarray] = None        # aligned 256 crop (source faces only, for skin tone)
 
     @property
     def area(self) -> float:
@@ -490,6 +565,7 @@ class Occluder:
 class FaceParser:
     """BiSeNet face parsing -> soft mask that follows the real face outline (no box edges on turned heads)."""
     REGIONS = [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]  # skin, brows, eyes, glasses, nose, mouth, lips
+    SKIN = [1, 10]                                # skin, nose
     MEAN = np.array([0.485, 0.456, 0.406], np.float32)
     STD = np.array([0.229, 0.224, 0.225], np.float32)
 
@@ -497,14 +573,22 @@ class FaceParser:
         self.session = session
         self.input_name = session.get_inputs()[0].name
 
-    def mask(self, crop: np.ndarray) -> np.ndarray:
+    def _labels(self, crop: np.ndarray) -> np.ndarray:
         x = cv2.resize(crop, (512, 512))[:, :, ::-1].astype(np.float32) / 255.0
         x = ((x - self.MEAN) / self.STD).transpose(2, 0, 1)[None]
-        out = self.session.run(None, {self.input_name: x})[0][0]
-        region = np.isin(out.argmax(0), self.REGIONS).astype(np.float32)
+        return self.session.run(None, {self.input_name: x})[0][0].argmax(0)
+
+    def mask(self, crop: np.ndarray) -> np.ndarray:
+        region = np.isin(self._labels(crop), self.REGIONS).astype(np.float32)
         region = cv2.dilate(region, np.ones((9, 9), np.uint8))
         region = cv2.resize(region, crop.shape[:2][::-1])
         return (cv2.GaussianBlur(region.clip(0, 1), (0, 0), 5).clip(0.5, 1) - 0.5) * 2
+
+    def skin(self, crop: np.ndarray) -> np.ndarray:
+        """Hard skin-only mask (no eyes, brows, lips, hair) for measuring skin tone."""
+        region = np.isin(self._labels(crop), self.SKIN).astype(np.uint8)
+        region = cv2.erode(region, np.ones((7, 7), np.uint8))
+        return cv2.resize(region.astype(np.float32), crop.shape[:2][::-1], interpolation=cv2.INTER_NEAREST)
 
 
 class Enhancer:
@@ -583,6 +667,7 @@ class Settings:
     swapper: str = 'alphaface_256'
     boost: int = 2                      # pixel boost multiplier (1, 2, 4)
     expression: float = 0.0             # 0 = off, 1 = fully the target's original expression
+    body_tone: float = 0.0              # 0 = off, 1 = body skin fully matched to the source face
     enhancer: Optional[str] = None      # 'gfpgan_1.4' | 'gpen_bfr_512' | None
     enhance_blend: float = 0.8
     occlusion: bool = False
@@ -613,6 +698,8 @@ class Pipeline:
         self._configs: dict = {}
         self._mask_cache: dict = {}
         self._tracks: List[_Track] = []
+        self._tone_memory: List[Tuple[np.ndarray, SkinStats]] = []   # (face centre, smoothed target stats)
+        self._source_tone: dict = {}
 
     # -- model management -------------------------------------------------- #
     def set_device(self, device: str) -> None:
@@ -653,7 +740,7 @@ class Pipeline:
             keys.append(settings.enhancer)
         if settings.occlusion:
             keys.append('xseg_1')
-        if settings.face_shape:
+        if settings.face_shape or settings.body_tone > 0:
             keys.append('bisenet_resnet_34')
         return keys
 
@@ -708,16 +795,19 @@ class Pipeline:
                 rec.embed(frame, f)
 
     def source_faces(self, images: Sequence[np.ndarray]) -> List[Face]:
-        """Largest face from each source image."""
+        """Largest face from each source image (keeps an aligned crop for skin-tone matching)."""
         result = []
         for img in images:
             faces = self.analyse(img)
             if faces:
-                result.append(max(faces, key=lambda f: f.area))
+                face = max(faces, key=lambda f: f.area)
+                face.crop, _ = warp_face(img, face.kps, 'arcface_128', 256)
+                result.append(face)
         return result
 
     def reset_tracking(self) -> None:
         self._tracks = []
+        self._tone_memory = []
 
     def _track(self, frame: np.ndarray, faces: List[Face], settings: Settings) -> List[Face]:
         """Smooth landmarks between frames and recover faces the detector briefly loses (head turns, blur)."""
@@ -756,6 +846,43 @@ class Pipeline:
         self._tracks = new_tracks
         return faces + recovered
 
+    # -- skin tone --------------------------------------------------------- #
+    def _skin(self, crop: np.ndarray, parser: Optional[FaceParser]) -> Optional[SkinStats]:
+        mask = None
+        if parser is not None:
+            try:
+                mask = parser.skin(crop)
+            except Exception:
+                mask = None
+        return skin_stats(crop, mask) or (skin_stats(crop, None) if mask is not None else None)
+
+    def _source_skin(self, source: Sequence[Face], parser: Optional[FaceParser]) -> Optional[SkinStats]:
+        key = (tuple(id(f) for f in source), parser is not None)
+        if key not in self._source_tone:
+            self._source_tone = {key: average_stats([self._skin(f.crop, parser) for f in source
+                                                     if f.crop is not None])}
+        return self._source_tone[key]
+
+    def _target_skin(self, frame: np.ndarray, face: Face, parser, video: bool) -> Optional[SkinStats]:
+        crop, _ = warp_face(frame, face.kps, 'arcface_128', 256)
+        stats = self._skin(crop, parser)
+        if not video:
+            return stats
+        centre = (face.bbox[:2] + face.bbox[2:]) / 2
+        size = max(face.bbox[2] - face.bbox[0], 1.0)
+        near = [i for i, (c, _) in enumerate(self._tone_memory) if np.linalg.norm(c - centre) < size]
+        if near:
+            i = near[0]
+            prev = self._tone_memory[i][1]
+            if stats is not None:  # smooth over time so the body colour never flickers
+                stats = (prev[0] * 0.85 + stats[0] * 0.15, prev[1] * 0.85 + stats[1] * 0.15)
+            else:
+                stats = prev
+            self._tone_memory[i] = (centre, stats)
+        elif stats is not None:
+            self._tone_memory.append((centre, stats))
+        return stats
+
     # -- processing -------------------------------------------------------- #
     def _crop_mask(self, size: int, settings: Settings) -> np.ndarray:
         key = (size, settings.mask_blur, tuple(settings.mask_padding))
@@ -783,19 +910,32 @@ class Pipeline:
             swapper = Swapper(self._session(key), cfg, self._emaps.get(key))
             embedding = swapper.source_embedding(source)
             occluder = Occluder(self._session('xseg_1')) if settings.occlusion else None
-            parser = FaceParser(self._session('bisenet_resnet_34')) if settings.face_shape else None
+            needs_parser = settings.face_shape or settings.body_tone > 0
+            parser = FaceParser(self._session('bisenet_resnet_34')) if needs_parser else None
+            shape_parser = parser if settings.face_shape else None
             restorer = ExpressionRestorer(*(self._session(k) for k in EXPRESSION_MODELS)) \
                 if settings.expression > 0 else None
             enhancer = Enhancer(self._session(settings.enhancer)) if settings.enhancer else None
 
             out = frame.copy()
+
+            # 1. body skin -> source skin tone (before the swap, so the face colour-matches the new body)
+            if settings.body_tone > 0:
+                src_skin = self._source_skin(source, parser)
+                if src_skin is not None:
+                    for face in faces:
+                        tgt_skin = self._target_skin(frame, face, parser, video)
+                        if tgt_skin is not None:
+                            tone_body(out, face, tgt_skin, src_skin, settings.body_tone)
+
+            # 2. swap
             crop_size = swapper.size * max(1, int(settings.boost))
             base_mask = self._crop_mask(crop_size, settings)
             for face in faces:
                 crop, matrix = warp_face(out, face.kps, cfg.template, crop_size)
                 mask = base_mask
-                if parser is not None:
-                    mask = np.minimum(mask, parser.mask(crop))
+                if shape_parser is not None:
+                    mask = np.minimum(mask, shape_parser.mask(crop))
                 if occluder is not None:
                     mask = np.minimum(mask, occluder.mask(crop))
                 swapped = swapper.swap_crop(crop, embedding)
@@ -803,7 +943,7 @@ class Pipeline:
                     swapped = match_colour(swapped, crop, mask, settings.colour_match)
                 paste_back(out, swapped, mask, matrix)
                 if restorer is not None:
-                    self._restore_expression(restorer, frame, out, face, settings, parser, occluder)
+                    self._restore_expression(restorer, frame, out, face, settings, shape_parser, occluder)
                 if enhancer is not None:
                     enhancer.enhance(out, face, settings.enhance_blend)
             return out

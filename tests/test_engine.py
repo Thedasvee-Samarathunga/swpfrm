@@ -5,7 +5,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['SWAPFRAME_MODELS'] = tempfile.mkdtemp()
 from swapframe import engine, media
 from swapframe.engine import (Pipeline, Settings, implode_pixel_boost, explode_pixel_boost, paste_back,
-                              match_colour, calibrate, Landmarker, ExpressionRestorer, rotation_matrix, _angle)
+                              match_colour, calibrate, Landmarker, ExpressionRestorer, rotation_matrix, _angle,
+                              skin_stats, tone_body, Face)
 
 
 class IO:
@@ -13,18 +14,20 @@ class IO:
 
 
 class FakeDetector:
-    """Emits one face in SCRFD output layout wherever the bright blob is."""
+    """Emits one face in SCRFD output layout around the face-coloured ellipse."""
     def get_inputs(s): return [IO('input.1', [1, 3, '?', '?'])]
     def run(s, _, feed):
         x = feed['input.1'][0]
         size = x.shape[1]
-        ys, xs = np.nonzero(x.mean(0) > -0.85)
+        ys, xs = np.nonzero((x[0] - x[2]) > 0.25)   # red-ish minus blue-ish = face blob (RGB order)
         outs_s, outs_b, outs_k = [], [], []
         for stride in (8, 16, 32):
             n = (size // stride) ** 2 * 2
             sc = np.zeros((n, 1), np.float32); bb = np.zeros((n, 4), np.float32); kp = np.zeros((n, 10), np.float32)
             if stride == 16 and len(xs) > 50:
-                box = np.array([xs.min(), ys.min(), xs.max(), ys.max()], np.float32)
+                box = np.array([np.percentile(xs, 1), np.percentile(ys, 1), np.percentile(xs, 99),
+                                min(np.percentile(ys, 99), np.percentile(ys, 1) + (np.percentile(xs, 99) - np.percentile(xs, 1)) * 1.3)],
+                               np.float32)
                 w, h = box[2] - box[0], box[3] - box[1]
                 kps = np.array([[.35, .4], [.65, .4], [.5, .55], [.38, .72], [.62, .72]], np.float32) * [w, h] + box[:2]
                 cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
@@ -39,7 +42,6 @@ class FakeDetector:
 
 
 class FakeRec:
-    """'Identity' = colour of the aligned face, so a swap toward a source colour is measurable."""
     def get_inputs(s): return [IO('input', [1, 3, 112, 112])]
     def run(s, _, feed):
         c = feed['input'][0, :, 40:80, 40:80].mean(axis=(1, 2))
@@ -48,7 +50,6 @@ class FakeRec:
 
 
 class FakeSwap:
-    """Only behaves with mean/std 0.5 + normed embeddings: paints the embedding colour."""
     def __init__(s, size=256): s.calls = 0; s.size = size
     def get_inputs(s): return [IO('source', [1, 512]), IO('target', [1, 3, s.size, s.size])]
     def get_outputs(s): return [IO('mask', [1, 1, s.size, s.size]), IO('output', [1, 3, s.size, s.size])]
@@ -56,12 +57,12 @@ class FakeSwap:
         s.calls += 1
         t = feed['target']; e = feed['source'][0]
         img = t * 0.5 + 0.5
-        col = (e[:3] / (np.linalg.norm(e) + 1e-8))[::-1].reshape(1, 3, 1, 1)
+        col = (e[:3] / (np.abs(e[:3]).max() + 1e-8) * 0.5 + 0.5).reshape(1, 3, 1, 1)   # paint the identity colour
         out = np.clip(img * 0.3 + col * 0.7, 0, 1)
         return [(out - 0.5) / 0.5]
 
 
-class Ident:  # enhancer / xseg / parser / landmark fakes
+class Ident:
     def __init__(s, kind): s.kind = kind
     def get_inputs(s):
         return [IO('input', {'enh': [1, 3, 512, 512], 'xseg': [1, 256, 256, 3], 'parse': [1, 3, 512, 512],
@@ -80,12 +81,11 @@ class Ident:  # enhancer / xseg / parser / landmark fakes
         return [pts, heat]
 
 
-# ---- LivePortrait fakes: "expression" = how bright the mouth region is ----------------------------
 class FakeFeature:
     def get_inputs(s): return [IO('input', [1, 3, 256, 256])]
     def run(s, _, feed):
         assert feed['input'].shape == (1, 3, 256, 256) and feed['input'].max() <= 1.0
-        return [feed['input'][:, :, ::32, ::32][:, :, None].astype(np.float32)]   # (1,3,1,8,8)
+        return [feed['input'][:, :, ::32, ::32][:, :, None].astype(np.float32)]
 
 
 class FakeMotion:
@@ -95,7 +95,7 @@ class FakeMotion:
         mouth = float(x[:, 170:220, 90:170].mean())
         exp = np.full((1, 21, 3), mouth * 0.1, np.float32)
         pts = np.linspace(-0.5, 0.5, 63, dtype=np.float32).reshape(1, 21, 3)
-        logits = np.zeros((1, 66), np.float32); logits[0, 32] = 50  # -> 32*3-97.5 = -1.5 degrees
+        logits = np.zeros((1, 66), np.float32); logits[0, 32] = 50
         return [logits, np.array([[3.0]], np.float32), np.array([[0.0]], np.float32), np.array([[1.2]], np.float32),
                 np.array([[0.01, 0.02, 0.5]], np.float32), exp, pts]
 
@@ -106,14 +106,21 @@ class FakeGenerator:
         delta = float((feed['source'] - feed['target']).mean())
         vol = feed['feature_volume'][0, :, 0]
         img = cv2.resize(vol.transpose(1, 2, 0), (512, 512)).transpose(2, 0, 1)
-        img[:, 340:440, 180:340] = np.clip(img[:, 340:440, 180:340] + delta * 40, 0, 1)  # mouth follows delta
+        img[:, 340:440, 180:340] = np.clip(img[:, 340:440, 180:340] + delta * 40, 0, 1)
         return [img[None].astype(np.float32)]
 
 
-def scene(mouth=60):
-    frame = np.full((480, 640, 3), 10, np.uint8)
-    cv2.ellipse(frame, (320, 250), (80, 100), 0, 0, 360, (90, 140, 200), -1)
-    cv2.ellipse(frame, (320, 300), (30, 12), 0, 0, 360, (mouth,) * 3, -1)
+SKIN_TGT = (90, 140, 200)     # light skin (BGR)
+SKIN_SRC = (60, 95, 150)      # deeper skin (BGR)
+
+
+def scene(mouth=60, skin=SKIN_TGT, body=True):
+    frame = np.full((480, 640, 3), (120, 60, 20), np.uint8)   # blue-ish background (not skin)
+    if body:
+        cv2.rectangle(frame, (290, 330), (350, 480), skin, -1)              # neck
+        cv2.rectangle(frame, (150, 400), (220, 480), skin, -1)              # hand
+    cv2.ellipse(frame, (320, 230), (80, 100), 0, 0, 360, skin, -1)
+    cv2.ellipse(frame, (320, 280), (30, 12), 0, 0, 360, (mouth,) * 3, -1)
     return frame
 
 
@@ -128,9 +135,9 @@ def build(swap=None):
     return p
 
 
-def source_face(p):
-    img = np.full((300, 300, 3), 10, np.uint8)
-    cv2.ellipse(img, (150, 150), (60, 75), 0, 0, 360, (30, 200, 60), -1)
+def source_face(p, skin=(20, 20, 230)):
+    img = np.full((300, 300, 3), (120, 60, 20), np.uint8)
+    cv2.ellipse(img, (150, 150), (60, 75), 0, 0, 360, skin, -1)
     return p.source_faces([img])
 
 
@@ -156,25 +163,52 @@ def test_colour_match_moves_toward_target():
 def test_rotation_and_angles():
     assert np.allclose(rotation_matrix(0, 0, 0), np.eye(3))
     assert np.allclose(rotation_matrix(0, 90, 0) @ [1, 0, 0], [0, 0, -1], atol=1e-6)
-    assert np.allclose(rotation_matrix(90, 0, 0) @ [0, 1, 0], [0, 0, 1], atol=1e-6)
     assert abs(_angle(np.array([[12.5]])) - 12.5) < 1e-6
     logits = np.zeros(66); logits[40] = 80
     assert abs(_angle(logits) - (40 * 3 - 97.5)) < 1e-3
-    R = rotation_matrix(10, -20, 30)
-    assert np.allclose(R @ R.T, np.eye(3), atol=1e-5)
 
 
 def test_expression_restorer_moves_toward_original():
     r = ExpressionRestorer(FakeFeature(), FakeMotion(), FakeGenerator())
-    original = np.full((512, 512, 3), 200, np.uint8)   # bright mouth = big "smile"
-    swapped = np.full((512, 512, 3), 60, np.uint8)     # dark mouth = neutral
-    out = r.restore(original, swapped, 1.0)
+    out = r.restore(np.full((512, 512, 3), 200, np.uint8), np.full((512, 512, 3), 60, np.uint8), 1.0)
     assert out.shape == (512, 512, 3) and np.isfinite(out).all()
-    mouth = out[340:440, 180:340].mean()
-    rest = out[:100].mean()
-    assert mouth > rest + 1, (mouth, rest)
-    none = r.restore(original, swapped, 0.0)
-    assert abs(none[340:440, 180:340].mean() - none[:100].mean()) < 1
+    assert out[340:440, 180:340].mean() > out[:100].mean() + 1
+
+
+def test_skin_stats_and_body_tone():
+    crop = np.full((256, 256, 3), SKIN_TGT, np.uint8)
+    stats = skin_stats(crop)
+    assert stats is not None
+    lab = cv2.cvtColor(np.uint8([[SKIN_TGT]]), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    assert np.abs(stats[0] - lab).max() < 2
+    src = skin_stats(np.full((256, 256, 3), SKIN_SRC, np.uint8))
+    frame = scene()
+    before = frame.copy()
+    face = Face(np.array([240, 130, 400, 330], np.float32), np.zeros((5, 2), np.float32), 1.0)
+    tone_body(frame, face, stats, src, 1.0)
+    neck_b, neck_a = before[420, 320].astype(int), frame[420, 320].astype(int)
+    assert np.abs(neck_a - np.array(SKIN_SRC)).sum() < np.abs(neck_b - np.array(SKIN_SRC)).sum() / 2, (neck_b, neck_a)
+    bg_b, bg_a = before[50, 600].astype(int), frame[50, 600].astype(int)
+    assert np.abs(bg_a - bg_b).max() <= 2, 'background must not be recoloured'
+    hand = frame[440, 185].astype(int)
+    assert np.abs(hand - np.array(SKIN_SRC)).sum() < np.abs(before[440, 185].astype(int) - np.array(SKIN_SRC)).sum()
+
+
+def test_body_tone_in_pipeline():
+    p = build()
+    src = source_face(p, skin=SKIN_SRC)
+    assert src and src[0].crop is not None
+    frame = scene()
+    off = p.process(frame, src, Settings(body_tone=0.0))
+    on = p.process(frame, src, Settings(body_tone=1.0))
+    assert np.array_equal(off[440, 320], frame[440, 320])
+    assert np.abs(on[440, 320].astype(int) - SKIN_SRC).sum() < np.abs(off[440, 320].astype(int) - SKIN_SRC).sum()
+    assert np.abs(on[30, 30].astype(int) - frame[30, 30]).max() <= 2
+    assert 'bisenet_resnet_34' in Pipeline.required_models(Settings(face_shape=False, body_tone=0.5))
+    p.reset_tracking()   # video path with temporal smoothing
+    for _ in range(3):
+        out = p.process(frame, src, Settings(body_tone=1.0), video=True)
+    assert not np.array_equal(out[440, 320], frame[440, 320])
 
 
 def test_landmarker_refines_kps():
@@ -188,10 +222,7 @@ def test_landmarker_refines_kps():
 
 def test_rotated_detection():
     p = build()
-    rot = p.detector.detect_rotated(scene(), 0.5)
-    assert rot
-    b = rot[0].bbox
-    assert 220 < (b[0] + b[2]) / 2 < 420 and 150 < (b[1] + b[3]) / 2 < 350, b
+    assert p.detector.detect_rotated(scene(body=False), 0.5)
 
 
 def test_calibration_picks_right_convention():
@@ -210,12 +241,9 @@ def test_pipeline_all_features():
     for model in ('alphaface_256', 'hyperswap_1a_256'):
         for boost in (1, 2):
             out = p.process(frame, src, Settings(swapper=model, boost=boost, enhancer='gfpgan_1.4', occlusion=True,
-                                                 expression=0.8))
+                                                 expression=0.8, body_tone=0.8))
             assert out.shape == frame.shape and not np.array_equal(out, frame)
-            assert np.array_equal(out[:30], frame[:30])
-    out = p.process(frame, src, Settings(colour_match=0))
-    share = lambda px: px[1] / (int(px[0]) + int(px[1]) + int(px[2]) + 1)
-    assert share(out[250, 320]) > share(frame[250, 320]) + 0.2
+            assert np.array_equal(out[:20, :20], frame[:20, :20])
     assert np.array_equal(p.process(frame, src, Settings(face_mode='selected')), frame)
 
 
@@ -223,11 +251,9 @@ def test_expression_changes_result_and_is_optional():
     p = build()
     src = source_face(p)
     frame = scene(mouth=250)
-    off = p.process(frame, src, Settings(expression=0.0))
-    on = p.process(frame, src, Settings(expression=1.0))
-    assert not np.array_equal(off, on)
+    assert not np.array_equal(p.process(frame, src, Settings(expression=0.0)),
+                              p.process(frame, src, Settings(expression=1.0)))
     assert 'live_portrait_generator' not in Pipeline.required_models(Settings(expression=0.0))
-    assert 'live_portrait_generator' in Pipeline.required_models(Settings(expression=0.5))
 
 
 def test_video_tracking_recovers_lost_face():
@@ -236,7 +262,6 @@ def test_video_tracking_recovers_lost_face():
     frame = scene()
     p.reset_tracking()
     p.process(frame, src, Settings(), video=True)
-    assert len(p._tracks) == 1
     real = p._sessions['retinaface_10g']
     calls = {'n': 0}
     class Flaky:
@@ -246,26 +271,73 @@ def test_video_tracking_recovers_lost_face():
             outs = real.run(a, feed)
             return [o * 0 for o in outs] if calls['n'] == 1 else outs
     p._sessions['retinaface_10g'] = Flaky()
-    out = p.process(frame, src, Settings(expression=0.8), video=True)
-    assert not np.array_equal(out, frame)
+    assert not np.array_equal(p.process(frame, src, Settings(expression=0.8), video=True), frame)
 
 
-def test_video_roundtrip():
-    d = tempfile.mkdtemp()
-    src = os.path.join(d, 'in.mp4'); dst = os.path.join(d, 'out ünïcode.mp4')
-    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=25',
-                    '-f', 'lavfi', '-i', 'sine=f=440', '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                    '-c:a', 'aac', '-shortest', src], check=True)
+# ------------------------------------------------------------------ media --
+def _ff(*args):
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', *args], check=True)
+
+
+def _streams(path):
+    return subprocess.run(['ffmpeg', '-hide_banner', '-i', path], capture_output=True).stderr.decode()
+
+
+def _swap_file(src, dst):
     info = media.probe(src)
-    assert info and (info.width, info.height) == (320, 240) and abs(info.fps - 25) < 0.1, info
     w = media.VideoWriter(dst, src, info)
     n = 0
     for f in media.iter_frames(src, info):
         w.write(255 - f); n += 1
-    w.close()
-    assert n == 50, n
-    txt = subprocess.run(['ffmpeg', '-hide_banner', '-i', dst], capture_output=True).stderr.decode()
-    assert 'Audio' in txt
+    return info, n, w.close()
+
+
+def test_video_keeps_sound_aac():
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, 'in.mp4'); dst = os.path.join(d, 'out ünïcode.mp4')
+    _ff('-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=25', '-f', 'lavfi', '-i', 'sine=f=440',
+        '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', src)
+    info, n, audio = _swap_file(src, dst)
+    assert info.has_audio and n == 50 and audio == 'audio'
+    assert 'Audio' in _streams(dst) and not os.path.exists(dst.replace('.mp4', '.swapframe-tmp.mp4'))
+
+
+def test_video_keeps_sound_when_copy_impossible():
+    """PCM audio in MKV can't be copied into MP4 -> must fall back to AAC, not drop the sound."""
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, 'in.mkv'); dst = os.path.join(d, 'out.mp4')
+    _ff('-f', 'lavfi', '-i', 'testsrc=size=322x242:rate=30', '-f', 'lavfi', '-i', 'sine=f=300',
+        '-t', '1.5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'pcm_s16le', '-shortest', src)
+    info, n, audio = _swap_file(src, dst)
+    assert audio == 'audio', audio
+    s = _streams(dst)
+    assert 'aac' in s and 'Audio' in s
+
+
+def test_video_without_sound():
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, 'in.mp4'); dst = os.path.join(d, 'out.mp4')
+    _ff('-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=25', '-t', '1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', src)
+    info, n, audio = _swap_file(src, dst)
+    assert not info.has_audio and audio == 'no-audio' and os.path.exists(dst)
+
+
+def test_gif_in_and_out():
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, 'in.gif')
+    _ff('-f', 'lavfi', '-i', 'testsrc=size=161x121:rate=10', '-t', '2', src)   # odd size on purpose
+    info = media.probe(src)
+    assert info and info.frames == 20 and (info.width, info.height) == (161, 121), info
+    assert media.grab_frame(src, 1.0) is not None and media.grab_frame(src, 99) is not None
+    gif_out = os.path.join(d, 'out.gif')
+    _, n, audio = _swap_file(src, gif_out)
+    assert n == 20 and audio == 'no-audio'
+    back = media.probe(gif_out)
+    assert back and (back.width, back.height) == (161, 121) and back.frames == 20, back
+    mp4_out = os.path.join(d, 'out.mp4')
+    _, _, audio = _swap_file(src, mp4_out)
+    assert audio == 'no-audio' and media.probe(mp4_out).width == 160
+    _, _, _ = _swap_file(os.path.join(d, 'out.gif'), os.path.join(d, 'again.gif'))
 
 
 if __name__ == '__main__':

@@ -8,14 +8,16 @@ from typing import Callable, List, Optional
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QIcon
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                               QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
-                               QSlider, QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QPalette
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+                               QLabel, QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton,
+                               QScrollArea, QSlider, QSplitter, QVBoxLayout, QWidget)
 
 from .. import media, models
 from ..engine import Face, Pipeline, Settings, available_devices
-from .widgets import DropFrame, PreviewView, Segmented, Switch, ThumbList, section, short_name, thumb
+from .style import THEME_NAMES, resolve, stylesheet
+from .widgets import (DropFrame, ElideLabel, PreviewView, Segmented, Switch, ThumbList, section, short_name,
+                      thumb)
 
 SWAPPER_CHOICES = [('AlphaFace · best for angles', 'alphaface_256'),
                    ('HyperSwap 1A', 'hyperswap_1a_256'), ('HyperSwap 1B', 'hyperswap_1b_256'),
@@ -24,12 +26,20 @@ ENHANCER_CHOICES = [('Off', None), ('GFPGAN 1.4', 'gfpgan_1.4'), ('GPEN 512', 'g
 FACE_MODES = [('Everyone', 'all'), ('Chosen people', 'selected'), ('Largest face', 'largest')]
 DETAIL = [('Standard', 1), ('High', 2), ('Max', 4)]
 IMAGE_FILTER = 'Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff)'
-MEDIA_FILTER = ('Photos and videos (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff '
+MEDIA_FILTER = ('Photos, videos and GIFs (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff '
                 '*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.gif)')
+SIDEBAR_MIN, SIDEBAR_DEFAULT = 360, 400
 
 
 def _bool(v) -> bool:
     return v in (True, 'true', 'True', 1, '1')
+
+
+def system_is_dark() -> bool:
+    try:
+        return QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    except Exception:
+        return QApplication.instance().palette().color(QPalette.ColorRole.Window).lightness() < 128
 
 
 class Task(QThread):
@@ -59,14 +69,40 @@ class Task(QThread):
             self.failed.emit(str(e) or e.__class__.__name__)
 
 
+class SliderRow(QWidget):
+    """Full-width slider with a live percentage on the right."""
+
+    def __init__(self, value: int, tip: str, on_release: Callable, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        self.slider = QSlider(Qt.Orientation.Horizontal, minimum=10, maximum=100, value=value)
+        self.slider.setToolTip(tip)
+        self.label = QLabel(f'{value}%', objectName='value')
+        self.label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.slider.valueChanged.connect(lambda v: self.label.setText(f'{v}%'))
+        self.slider.sliderReleased.connect(on_release)
+        lay.addWidget(self.slider, 1)
+        lay.addWidget(self.label)
+
+    def value(self) -> int:
+        return self.slider.value()
+
+    def setValue(self, v: int):  # noqa: N802
+        self.slider.setValue(v)
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, colors: dict, family: str):
+    def __init__(self, family: str):
         super().__init__()
-        self.colors = colors
-        self.setWindowTitle('Swapframe')
-        self.resize(1320, 880)
-        self.setMinimumSize(1000, 680)
+        self.family = family
         self.store = QSettings('Swapframe', 'Swapframe')
+        self.theme_name = self.store.value('theme', 'System')
+        self.colors = resolve(self.theme_name, system_is_dark())
+        self.setWindowTitle('Swapframe')
+        self.resize(1400, 900)
+        self.setMinimumSize(1000, 700)
 
         devices = available_devices()
         saved_device = self.store.value('device', devices[0])
@@ -89,45 +125,102 @@ class MainWindow(QMainWindow):
         self.render_task: Optional[Task] = None
         self.comparing = False
         self.last_output: Optional[str] = None
+        self.switches: List[Switch] = []
 
         self._build(devices)
         self._load_settings()
+        self.apply_theme(self.theme_name)
+        try:
+            QGuiApplication.styleHints().colorSchemeChanged.connect(
+                lambda *_: self.theme_name == 'System' and self.apply_theme('System'))
+        except Exception:
+            pass
 
         self.preview_timer = QTimer(self, singleShot=True, interval=280, timeout=self._run_preview)
         self.seek_timer = QTimer(self, singleShot=True, interval=180, timeout=self._seek)
 
+    # -------------------------------------------------------------- theme --
+    def apply_theme(self, name: str):
+        self.theme_name = name
+        c = self.colors = resolve(name, system_is_dark())
+        app = QApplication.instance()
+        pal = app.palette()
+        for role, key in ((QPalette.ColorRole.Window, 'bg'), (QPalette.ColorRole.WindowText, 'text'),
+                          (QPalette.ColorRole.Base, 'panel'), (QPalette.ColorRole.AlternateBase, 'sunken'),
+                          (QPalette.ColorRole.Text, 'text'), (QPalette.ColorRole.Button, 'sunken'),
+                          (QPalette.ColorRole.ButtonText, 'text'), (QPalette.ColorRole.Highlight, 'accent'),
+                          (QPalette.ColorRole.HighlightedText, 'accent_text'), (QPalette.ColorRole.ToolTipBase, 'panel'),
+                          (QPalette.ColorRole.ToolTipText, 'text'), (QPalette.ColorRole.PlaceholderText, 'muted')):
+            pal.setColor(role, QColor(c[key]))
+        app.setPalette(pal)
+        app.setStyleSheet(stylesheet(c, self.family))
+        for sw in self.switches:
+            sw.set_colors(c['accent'], c['track'])
+        self.preview.set_colors(c)
+        self.store.setValue('theme', name)
+
     # ------------------------------------------------------------------ UI --
     def _switch(self, text: str, tip: str) -> Switch:
-        sw = Switch(text, accent=self.colors['accent'], track=self.colors['track'])
+        sw = Switch(text)
         sw.setToolTip(tip)
         sw.toggled.connect(self._settings_changed)
+        self.switches.append(sw)
         return sw
+
+    def _group(self, layout: QVBoxLayout, title: str, *items, first: bool = False):
+        """A titled block in the sidebar with comfortable spacing."""
+        if not first:
+            layout.addSpacing(10)
+        layout.addWidget(section(title))
+        for item in items:
+            if isinstance(item, QWidget):
+                layout.addWidget(item)
+            else:
+                layout.addLayout(item)
 
     def _build(self, devices: List[str]):
         root = QWidget(objectName='root')
         self.setCentralWidget(root)
         outer = QHBoxLayout(root)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(16)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(0)
 
-        # ---- sidebar
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(14)
+        outer.addWidget(self.splitter)
+
+        # ---- sidebar (scrolls vertically, never clipped sideways)
         side_panel = QFrame(objectName='panel')
-        side_panel.setFixedWidth(340)
+        side_panel.setMinimumWidth(SIDEBAR_MIN)
+        sp = QVBoxLayout(side_panel)
+        sp.setContentsMargins(0, 0, 0, 0)
+        sp.setSpacing(0)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(20, 16, 16, 12)
+        header.addWidget(QLabel('Swapframe', objectName='title'))
+        header.addStretch()
+        self.theme_box = QComboBox()
+        self.theme_box.setToolTip('Theme')
+        for name in THEME_NAMES:
+            self.theme_box.addItem(name, name)
+        self.theme_box.setCurrentIndex(max(0, self.theme_box.findData(self.theme_name)))
+        self.theme_box.currentIndexChanged.connect(lambda *_: self.apply_theme(self.theme_box.currentData()))
+        header.addWidget(self.theme_box)
+        sp.addLayout(header)
+
         side_scroll = QScrollArea()
         side_scroll.setWidgetResizable(True)
         side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        side_scroll.setFrameShape(QFrame.Shape.NoFrame)
         side_inner = QWidget()
         side_inner.setStyleSheet('background: transparent;')
         side = QVBoxLayout(side_inner)
-        side.setContentsMargins(18, 18, 18, 18)
-        side.setSpacing(10)
+        side.setContentsMargins(20, 4, 20, 20)   # right margin leaves room for the scrollbar
+        side.setSpacing(8)
         side_scroll.setWidget(side_inner)
-        sp = QVBoxLayout(side_panel)
-        sp.setContentsMargins(0, 0, 0, 0)
-        sp.addWidget(side_scroll)
-
-        side.addWidget(QLabel('Swapframe', objectName='title'))
-        side.addSpacing(4)
+        sp.addWidget(side_scroll, 1)
 
         # source faces
         row = QHBoxLayout()
@@ -138,8 +231,8 @@ class MainWindow(QMainWindow):
         self.src_drop = DropFrame()
         self.src_drop.files.connect(self._add_sources)
         sd = QVBoxLayout(self.src_drop)
-        sd.setContentsMargins(10, 10, 10, 10)
-        sd.setSpacing(6)
+        sd.setContentsMargins(12, 12, 12, 12)
+        sd.setSpacing(8)
         self.src_list = ThumbList(64, flow_wrap=False)
         self.src_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.src_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -152,106 +245,93 @@ class MainWindow(QMainWindow):
         side.addWidget(self.src_drop)
 
         # target
-        side.addSpacing(6)
-        side.addWidget(section('Target'))
         self.tgt_drop = DropFrame()
         self.tgt_drop.files.connect(lambda p: self._set_target(p[0]))
         td = QHBoxLayout(self.tgt_drop)
-        td.setContentsMargins(10, 10, 10, 10)
+        td.setContentsMargins(12, 12, 12, 12)
+        td.setSpacing(10)
         self.tgt_thumb = QLabel()
         self.tgt_thumb.setFixedSize(52, 52)
         self.tgt_thumb.hide()
         td.addWidget(self.tgt_thumb)
         tcol = QVBoxLayout()
         tcol.setSpacing(2)
-        self.tgt_name = QLabel('Photo or video')
-        self.tgt_meta = QLabel('', objectName='hint')
+        self.tgt_name = ElideLabel('Photo, video or GIF')
+        self.tgt_meta = ElideLabel('', objectName='hint')
         tcol.addWidget(self.tgt_name)
         tcol.addWidget(self.tgt_meta)
         td.addLayout(tcol, 1)
         td.addWidget(QPushButton('Browse', clicked=self._browse_target))
-        side.addWidget(self.tgt_drop)
+        self._group(side, 'Target', self.tgt_drop)
 
-        # model
-        side.addSpacing(6)
-        side.addWidget(section('Model'))
+        # model + detail
         self.model_box = QComboBox()
         for label, key in SWAPPER_CHOICES:
             self.model_box.addItem(label, key)
         self.model_box.currentIndexChanged.connect(self._settings_changed)
-        side.addWidget(self.model_box)
+        self._group(side, 'Model', self.model_box)
 
-        side.addWidget(section('Detail'))
         self.detail = Segmented([d[0] for d in DETAIL])
         self.detail.changed.connect(self._settings_changed)
-        side.addWidget(self.detail)
+        self._group(side, 'Detail', self.detail)
 
         # expression
-        side.addWidget(section('Expression'))
-        xrow = QHBoxLayout()
         self.expr_switch = self._switch('Keep target expression',
-                                        "Copies the original smile, eyes, brows and mouth back onto the new face")
-        self.expr_slider = QSlider(Qt.Orientation.Horizontal, minimum=10, maximum=100, value=80)
-        self.expr_slider.setToolTip('How strongly to copy the original expression')
-        self.expr_slider.setFixedWidth(90)
-        self.expr_slider.sliderReleased.connect(self._settings_changed)
-        xrow.addWidget(self.expr_switch, 1)
-        xrow.addWidget(self.expr_slider)
-        side.addLayout(xrow)
+                                        'Copies the original smile, eyes, brows and mouth back onto the new face')
+        self.expr_row = SliderRow(80, 'How strongly to copy the original expression', self._settings_changed)
+        self._group(side, 'Expression', self.expr_switch, self.expr_row)
 
-        side.addWidget(section('Enhance'))
-        erow = QHBoxLayout()
+        # skin
+        self.body_switch = self._switch('Match body skin to new face',
+                                        "Recolours the target's neck, arms and hands to the source face's skin tone")
+        self.body_row = SliderRow(80, 'How strongly to match the body skin tone', self._settings_changed)
+        self.tone_switch = self._switch('Match face to scene lighting', 'Adapt the new face to the scene lighting')
+        self._group(side, 'Skin tone', self.body_switch, self.body_row, self.tone_switch)
+
+        # enhance
         self.enh_box = QComboBox()
         for label, key in ENHANCER_CHOICES:
             self.enh_box.addItem(label, key)
         self.enh_box.currentIndexChanged.connect(self._settings_changed)
-        self.enh_slider = QSlider(Qt.Orientation.Horizontal, minimum=10, maximum=100, value=80)
-        self.enh_slider.setToolTip('Enhance strength')
-        self.enh_slider.sliderReleased.connect(self._settings_changed)
-        erow.addWidget(self.enh_box, 1)
-        erow.addWidget(self.enh_slider, 1)
-        side.addLayout(erow)
+        self.enh_row = SliderRow(80, 'Enhance strength', self._settings_changed)
+        self._group(side, 'Enhance', self.enh_box, self.enh_row)
 
-        side.addWidget(section('Faces'))
+        # faces
         self.face_box = QComboBox()
         for label, key in FACE_MODES:
             self.face_box.addItem(label, key)
         self.face_box.currentIndexChanged.connect(self._face_mode_changed)
-        side.addWidget(self.face_box)
+        self._group(side, 'Faces', self.face_box)
 
         # natural look
-        side.addSpacing(6)
-        side.addWidget(section('Natural look'))
         self.shape_switch = self._switch('Follow face shape', 'Blend along the real face outline instead of a box')
-        self.tone_switch = self._switch('Match skin tone and lighting', 'Adapt the new face to the scene lighting')
         self.lm_switch = self._switch('Precise alignment', '68-point landmarks for turned heads and expressions')
         self.occl_switch = self._switch('Keep hands and hair in front', 'Objects covering the face stay on top')
         self.steady_switch = self._switch('Steady video tracking', 'Smooth jitter and keep faces through head turns')
-        for sw in (self.shape_switch, self.tone_switch, self.lm_switch, self.occl_switch, self.steady_switch):
-            side.addWidget(sw)
+        self._group(side, 'Natural look', self.shape_switch, self.lm_switch, self.occl_switch, self.steady_switch)
 
-        side.addSpacing(4)
-        side.addWidget(section('Device'))
+        # device
         self.device_box = QComboBox()
         for d in devices:
             self.device_box.addItem(d, d)
         self.device_box.setCurrentIndex(max(0, devices.index(self.pipeline.device)))
         self.device_box.currentIndexChanged.connect(self._device_changed)
-        side.addWidget(self.device_box)
+        self._group(side, 'Device', self.device_box)
         side.addStretch()
+        side.addSpacing(6)
         side.addWidget(QPushButton('Open models folder', objectName='ghost',
                                    clicked=lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(models.models_dir()))),
                        alignment=Qt.AlignmentFlag.AlignLeft)
-        outer.addWidget(side_panel)
+        self.splitter.addWidget(side_panel)
 
         # ---- main area
         main_panel = QFrame(objectName='panel')
+        main_panel.setMinimumWidth(480)
         main = QVBoxLayout(main_panel)
         main.setContentsMargins(16, 16, 16, 16)
         main.setSpacing(12)
 
         self.preview = PreviewView()
-        self.preview.set_colors(self.colors)
         self.preview.files.connect(self._preview_drop)
         main.addWidget(self.preview, 1)
 
@@ -286,7 +366,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.compare_btn)
         status_col = QVBoxLayout()
         status_col.setSpacing(4)
-        self.status = QLabel('Add a face and a target to begin', objectName='muted')
+        self.status = ElideLabel('Add a face and a target to begin', objectName='muted')
         self.progress = QProgressBar(textVisible=False)
         self.progress.hide()
         status_col.addWidget(self.status)
@@ -300,21 +380,29 @@ class MainWindow(QMainWindow):
         self.go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         bar.addWidget(self.go_btn)
         main.addLayout(bar)
-        outer.addWidget(main_panel, 1)
+        self.splitter.addWidget(main_panel)
+
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        width = int(self.store.value('sidebar_width', SIDEBAR_DEFAULT))
+        self.splitter.setSizes([max(SIDEBAR_MIN, width), 1000])
+        self.splitter.splitterMoved.connect(lambda *_: self.store.setValue('sidebar_width', self.splitter.sizes()[0]))
 
     # ------------------------------------------------------------ settings --
     def _load_settings(self):
         s = self.store
-        widgets = (self.model_box, self.enh_box, self.enh_slider, self.expr_switch, self.expr_slider,
-                   self.shape_switch, self.tone_switch, self.lm_switch, self.occl_switch, self.steady_switch)
+        widgets = [self.model_box, self.enh_box, self.enh_row.slider, self.expr_row.slider, self.body_row.slider,
+                   *self.switches]
         for w in widgets:
             w.blockSignals(True)
         self.model_box.setCurrentIndex(max(0, self.model_box.findData(s.value('swapper', 'alphaface_256'))))
         self.detail.set_index(int(s.value('detail', 1)))
         self.expr_switch.setChecked(_bool(s.value('expression_on', True)))
-        self.expr_slider.setValue(int(s.value('expression', 80)))
+        self.expr_row.setValue(int(s.value('expression', 80)))
+        self.body_switch.setChecked(_bool(s.value('body_tone_on', False)))
+        self.body_row.setValue(int(s.value('body_tone', 80)))
         self.enh_box.setCurrentIndex(max(0, self.enh_box.findData(s.value('enhancer', None) or None)))
-        self.enh_slider.setValue(int(s.value('enhance_blend', 80)))
+        self.enh_row.setValue(int(s.value('enhance_blend', 80)))
         self.shape_switch.setChecked(_bool(s.value('face_shape', True)))
         self.tone_switch.setChecked(_bool(s.value('colour_match', True)))
         self.lm_switch.setChecked(_bool(s.value('landmarks', True)))
@@ -322,6 +410,8 @@ class MainWindow(QMainWindow):
         self.steady_switch.setChecked(_bool(s.value('stabilise', True)))
         for w in widgets:
             w.blockSignals(False)
+        for row in (self.expr_row, self.body_row, self.enh_row):  # refresh % labels
+            row.label.setText(f'{row.value()}%')
         self._sync_sliders()
 
     def _save_settings(self):
@@ -329,9 +419,11 @@ class MainWindow(QMainWindow):
         s.setValue('swapper', self.model_box.currentData())
         s.setValue('detail', self.detail.index())
         s.setValue('expression_on', self.expr_switch.isChecked())
-        s.setValue('expression', self.expr_slider.value())
+        s.setValue('expression', self.expr_row.value())
+        s.setValue('body_tone_on', self.body_switch.isChecked())
+        s.setValue('body_tone', self.body_row.value())
         s.setValue('enhancer', self.enh_box.currentData() or '')
-        s.setValue('enhance_blend', self.enh_slider.value())
+        s.setValue('enhance_blend', self.enh_row.value())
         s.setValue('face_shape', self.shape_switch.isChecked())
         s.setValue('colour_match', self.tone_switch.isChecked())
         s.setValue('landmarks', self.lm_switch.isChecked())
@@ -340,16 +432,18 @@ class MainWindow(QMainWindow):
         s.setValue('device', self.device_box.currentData())
 
     def _sync_sliders(self):
-        self.enh_slider.setEnabled(self.enh_box.currentData() is not None)
-        self.expr_slider.setEnabled(self.expr_switch.isChecked())
+        self.enh_row.setEnabled(self.enh_box.currentData() is not None)
+        self.expr_row.setEnabled(self.expr_switch.isChecked())
+        self.body_row.setEnabled(self.body_switch.isChecked())
 
     def settings(self) -> Settings:
         return Settings(
             swapper=self.model_box.currentData(),
             boost=DETAIL[self.detail.index()][1],
-            expression=self.expr_slider.value() / 100.0 if self.expr_switch.isChecked() else 0.0,
+            expression=self.expr_row.value() / 100.0 if self.expr_switch.isChecked() else 0.0,
+            body_tone=self.body_row.value() / 100.0 if self.body_switch.isChecked() else 0.0,
             enhancer=self.enh_box.currentData(),
-            enhance_blend=self.enh_slider.value() / 100.0,
+            enhance_blend=self.enh_row.value() / 100.0,
             occlusion=self.occl_switch.isChecked(),
             face_shape=self.shape_switch.isChecked(),
             landmarks=self.lm_switch.isChecked(),
@@ -475,12 +569,12 @@ class MainWindow(QMainWindow):
         else:
             extra = f'  ·  {missing} skipped' if missing else ''
             self.src_hint.setText(f'{n} photo{"s" if n > 1 else ""} blended into one identity{extra}')
-        self.status.setText('Ready' if self.frame is not None else 'Now add a target photo or video')
+        self.status.setText('Ready' if self.frame is not None else 'Now add a target photo, video or GIF')
         self._schedule_preview()
 
     # ------------------------------------------------------------- target --
     def _browse_target(self):
-        path, _ = QFileDialog.getOpenFileName(self, 'Choose a photo or video', self._last_dir(), MEDIA_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, 'Choose a photo, video or GIF', self._last_dir(), MEDIA_FILTER)
         if path:
             self._set_target(path)
 
@@ -522,12 +616,14 @@ class MainWindow(QMainWindow):
         if path != self.target_path:
             return
         if info is None or frame is None:
-            self.status.setText('Could not open that video')
+            self.status.setText('Could not open that file')
             self.tgt_meta.setText('')
             return
         self.video_info = info
-        mins, secs = divmod(int(info.duration), 60)
-        self._target_loaded(frame, f'{info.width} × {info.height}  ·  {info.fps:.0f} fps  ·  {mins}:{secs:02d}')
+        mins, secs = divmod(int(round(info.duration)), 60)
+        kind = 'GIF' if media.is_gif(path) else ('sound' if info.has_audio else 'no sound')
+        self._target_loaded(frame, f'{info.width} × {info.height}  ·  {info.fps:.0f} fps  ·  {mins}:{secs:02d}'
+                                   f'  ·  {kind}')
 
     def _target_loaded(self, frame: np.ndarray, meta: str):
         self.frame = frame
@@ -539,11 +635,12 @@ class MainWindow(QMainWindow):
         self.steady_switch.setVisible(is_video)
         if is_video:
             self.scrub_slider.blockSignals(True)
-            self.scrub_slider.setRange(0, self.video_info.frames - 1)
+            self.scrub_slider.setRange(0, max(0, self.video_info.frames - 1))
             self.scrub_slider.setValue(0)
             self.scrub_slider.blockSignals(False)
             self._update_time(0)
-        self.go_btn.setText('Swap video' if is_video else 'Save image')
+        is_gif = is_video and media.is_gif(self.target_path)
+        self.go_btn.setText('Swap GIF' if is_gif else 'Swap video' if is_video else 'Save image')
         self.strip.setVisible(self.face_box.currentData() == 'selected')
         self.face_list.clear()
         self._show_frame()
@@ -713,11 +810,14 @@ class MainWindow(QMainWindow):
         self.status.setText(f'Saved {os.path.basename(path)}')
 
     def _render_video(self):
-        path, _ = QFileDialog.getSaveFileName(self, 'Save video', self._default_out('.mp4'), 'MP4 video (*.mp4)')
+        gif_in = media.is_gif(self.target_path)
+        filters = ['GIF (*.gif)', 'MP4 video (*.mp4)'] if gif_in else ['MP4 video (*.mp4)', 'GIF (*.gif)']
+        path, chosen = QFileDialog.getSaveFileName(self, 'Save as', self._default_out('.gif' if gif_in else '.mp4'),
+                                                   ';;'.join(filters))
         if not path:
             return
-        if not path.lower().endswith('.mp4'):
-            path += '.mp4'
+        if os.path.splitext(path)[1].lower() not in ('.mp4', '.gif'):
+            path += '.gif' if 'gif' in chosen.lower() else '.mp4'
         if os.path.abspath(path) == os.path.abspath(self.target_path):
             self.status.setText('Choose a different file name than the original')
             return
@@ -746,7 +846,8 @@ class MainWindow(QMainWindow):
                     if now - last_preview > 0.6:
                         last_preview = now
                         task.frame.emit(out)
-                writer.close()
+                task.progress.emit('__finish__', 0, 0)
+                audio = writer.close()
             except BaseException:
                 writer.abort()
                 try:
@@ -754,12 +855,16 @@ class MainWindow(QMainWindow):
                 except OSError:
                     pass
                 raise
-            return path
+            return path, audio
 
         self.render_task = self._start(job, self._render_done, self._render_failed,
                                        self._render_progress, self._render_frame)
 
     def _render_progress(self, label: str, done: int, total: int):
+        if label == '__finish__':
+            self.progress.setRange(0, 0)
+            self.status.setText('Finishing file and adding sound…')
+            return
         if not label.startswith('__render__'):
             self._download_progress(label, done, total)
             return
@@ -776,34 +881,39 @@ class MainWindow(QMainWindow):
         self.result = frame
         self._show_frame()
 
-    def _render_done(self, path: str):
+    def _render_done(self, payload):
+        path, audio = payload
         self.render_task = None
         self.last_output = path
         self.progress.hide()
         self._set_controls_enabled(True)
-        self.go_btn.setText('Swap video')
+        self._target_loaded_button()
         self.open_btn.show()
-        self.status.setText(f'Saved {os.path.basename(path)}')
+        note = {'audio': 'with sound', 'no-audio': '' if media.is_gif(path) else 'original had no sound',
+                'audio-failed': "couldn't copy the sound"}.get(audio, '')
+        self.status.setText(f'Saved {os.path.basename(path)}' + (f'  ·  {note}' if note else ''))
         self._update_actions()
 
     def _render_failed(self, msg: str):
         self.render_task = None
         self.progress.hide()
         self._set_controls_enabled(True)
-        self.go_btn.setText('Swap video')
+        self._target_loaded_button()
         self.status.setText('Stopped' if msg == 'Cancelled' else f'Something went wrong: {msg}')
         self._update_actions()
 
+    def _target_loaded_button(self):
+        self.go_btn.setText('Swap GIF' if self.target_path and media.is_gif(self.target_path) else 'Swap video')
+
     def _set_controls_enabled(self, on: bool):
-        for w in (self.src_drop, self.tgt_drop, self.model_box, self.detail, self.expr_switch, self.enh_box,
-                  self.face_box, self.shape_switch, self.tone_switch, self.lm_switch, self.occl_switch,
-                  self.steady_switch, self.device_box, self.scrub, self.strip):
+        for w in (self.src_drop, self.tgt_drop, self.model_box, self.detail, self.enh_box, self.face_box,
+                  self.device_box, self.scrub, self.strip, self.theme_box, *self.switches):
             w.setEnabled(on)
         if on:
             self._sync_sliders()
         else:
-            self.expr_slider.setEnabled(False)
-            self.enh_slider.setEnabled(False)
+            for row in (self.expr_row, self.body_row, self.enh_row):
+                row.setEnabled(False)
         self.preview.setAcceptDrops(on)
 
     def _reveal_last(self):
@@ -818,6 +928,7 @@ class MainWindow(QMainWindow):
         self.store.setValue('last_dir', os.path.dirname(path))
 
     def closeEvent(self, e):
+        self.store.setValue('sidebar_width', self.splitter.sizes()[0])
         for t in list(self.tasks):
             t.cancel()
         for t in list(self.tasks):

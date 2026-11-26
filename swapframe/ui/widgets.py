@@ -72,6 +72,9 @@ class DropFrame(QFrame):
 
 
 class Switch(QAbstractButton):
+    """Label on the left, animated toggle on the right. Sizes itself to its text so nothing gets clipped."""
+    TRACK_W, TRACK_H, GAP = 36, 20, 12
+
     def __init__(self, text: str = '', parent=None, accent='#5B5BF0', track='#D9DCE5'):
         super().__init__(parent)
         self.setCheckable(True)
@@ -84,6 +87,10 @@ class Switch(QAbstractButton):
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.toggled.connect(self._animate)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_colors(self, accent: str, track: str):
+        self.accent, self.track = QColor(accent), QColor(track)
+        self.update()
 
     def _animate(self, on: bool):
         self._anim.stop()
@@ -106,13 +113,17 @@ class Switch(QAbstractButton):
     pos_ = Property(float, get_pos, set_pos)
 
     def sizeHint(self):
-        return QSize(200, 26)
+        fm = self.fontMetrics()
+        return QSize(fm.horizontalAdvance(self.text()) + self.GAP + self.TRACK_W + 2, max(28, fm.height() + 10))
+
+    def minimumSizeHint(self):
+        return QSize(self.TRACK_W + 80, self.sizeHint().height())
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = 36, 20
-        x = self.width() - w
+        w, h = self.TRACK_W, self.TRACK_H
+        x = self.width() - w - 1
         y = (self.height() - h) / 2
         track = QColor(self.track)
         if self._pos > 0:
@@ -129,8 +140,10 @@ class Switch(QAbstractButton):
         d = h - 6
         p.drawEllipse(QRectF(x + 3 + (w - d - 6) * self._pos, y + 3, d, d))
         p.setPen(self.palette().color(self.foregroundRole()))
-        p.drawText(QRectF(0, 0, x - 10, self.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                   self.text())
+        text_w = int(x - self.GAP)
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, text_w)
+        p.drawText(QRectF(0, 0, text_w, self.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   text)
         p.end()
 
 
@@ -149,6 +162,7 @@ class Segmented(QFrame):
             b.setObjectName('seg')
             b.setCheckable(True)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setMinimumWidth(10)
             self.group.addButton(b, i)
             lay.addWidget(b)
         self.group.idClicked.connect(self.changed.emit)
@@ -170,11 +184,15 @@ class PreviewView(QWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(200, 200)
         self._image: Optional[QImage] = None
-        self._placeholder = 'Drop a photo or video here'
+        self._placeholder = 'Drop a photo, video or GIF here'
         self._colors = dict(sunken='#EEF0F5', muted='#6A6F7E', accent='#5B5BF0')
         self._busy = False
         self._drag = False
+
+    def sizeHint(self):
+        return QSize(640, 480)
 
     def set_colors(self, colors: dict):
         self._colors = colors
@@ -257,7 +275,8 @@ class ThumbList(QListWidget):
             self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setSpacing(2)
         self.setUniformItemSizes(True)
-        self.setFixedHeight(size + 22)
+        self.setFixedHeight(size + 26)
+        self.setMinimumWidth(10)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         # let drops fall through to the parent drop zone
         self.setDragEnabled(False)
@@ -265,8 +284,33 @@ class ThumbList(QListWidget):
         self.viewport().setAcceptDrops(False)
 
 
+class ElideLabel(QLabel):
+    """Single-line label that shortens with '…' instead of forcing its parent wider."""
+
+    def __init__(self, text: str = '', parent=None, **kw):
+        super().__init__(text, parent, **kw)
+        self._full = text
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(10)
+
+    def setText(self, text: str):  # noqa: N802
+        self._full = text
+        self.setToolTip(text if len(text) > 40 else '')
+        self._refresh()
+
+    def text_full(self) -> str:
+        return self._full
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._refresh()
+
+    def _refresh(self):
+        super().setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(10, self.width())))
+
+
 def section(text: str) -> QLabel:
-    lbl = QLabel(text)
+    lbl = QLabel(text.upper())
     lbl.setObjectName('section')
     return lbl
 
