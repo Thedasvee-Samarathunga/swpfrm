@@ -9,7 +9,7 @@ import numpy as np
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRectF, QSize, Qt, Signal, Property
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (QAbstractButton, QButtonGroup, QFrame, QHBoxLayout, QLabel, QListWidget,
-                               QListView, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+                               QListView, QPushButton, QSizePolicy, QWidget)
 
 
 def to_qimage(bgr: np.ndarray) -> QImage:
@@ -85,10 +85,6 @@ class Switch(QAbstractButton):
         self.toggled.connect(self._animate)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def set_colors(self, accent: str, track: str):
-        self.accent, self.track = QColor(accent), QColor(track)
-        self.update()
-
     def _animate(self, on: bool):
         self._anim.stop()
         self._anim.setEndValue(1.0 if on else 0.0)
@@ -124,6 +120,8 @@ class Switch(QAbstractButton):
             track = QColor(int(t.red() + (a.red() - t.red()) * self._pos),
                            int(t.green() + (a.green() - t.green()) * self._pos),
                            int(t.blue() + (a.blue() - t.blue()) * self._pos))
+        if not self.isEnabled():
+            track.setAlpha(120)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(track)
         p.drawRoundedRect(QRectF(x, y, w, h), h / 2, h / 2)
@@ -245,7 +243,7 @@ class PreviewView(QWidget):
 
 
 class ThumbList(QListWidget):
-    """Horizontal/flow list of rounded thumbnails."""
+    """Row/flow list of rounded thumbnails."""
 
     def __init__(self, size: int = 64, flow_wrap: bool = True, parent=None):
         super().__init__(parent)
@@ -271,18 +269,6 @@ def section(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setObjectName('section')
     return lbl
-
-
-def vbox(*widgets, spacing=8, margins=(0, 0, 0, 0)) -> QVBoxLayout:
-    lay = QVBoxLayout()
-    lay.setSpacing(spacing)
-    lay.setContentsMargins(*margins)
-    for w in widgets:
-        if isinstance(w, QWidget):
-            lay.addWidget(w)
-        else:
-            lay.addLayout(w)
-    return lay
 
 
 def short_name(path: str, limit: int = 34) -> str:

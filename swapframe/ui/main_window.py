@@ -2,27 +2,34 @@
 from __future__ import annotations
 
 import os
+import time
 import traceback
 from typing import Callable, List, Optional
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidgetItem,
-                               QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-                               QSlider, QVBoxLayout, QWidget, QAbstractItemView)
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+                               QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
+                               QSlider, QVBoxLayout, QWidget)
 
 from .. import media, models
 from ..engine import Face, Pipeline, Settings, available_devices
-from .widgets import (DropFrame, PreviewView, Segmented, Switch, ThumbList, section, short_name, thumb)
+from .widgets import DropFrame, PreviewView, Segmented, Switch, ThumbList, section, short_name, thumb
 
-SWAPPER_CHOICES = [('HyperSwap 1A', 'hyperswap_1a_256'), ('HyperSwap 1B', 'hyperswap_1b_256'),
+SWAPPER_CHOICES = [('AlphaFace · best for angles', 'alphaface_256'),
+                   ('HyperSwap 1A', 'hyperswap_1a_256'), ('HyperSwap 1B', 'hyperswap_1b_256'),
                    ('HyperSwap 1C', 'hyperswap_1c_256'), ('InSwapper 128', 'inswapper_128_fp16')]
 ENHANCER_CHOICES = [('Off', None), ('GFPGAN 1.4', 'gfpgan_1.4'), ('GPEN 512', 'gpen_bfr_512')]
 FACE_MODES = [('Everyone', 'all'), ('Chosen people', 'selected'), ('Largest face', 'largest')]
 DETAIL = [('Standard', 1), ('High', 2), ('Max', 4)]
 IMAGE_FILTER = 'Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff)'
-MEDIA_FILTER = 'Photos and videos (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.mp4 *.mov *.mkv *.avi *.webm *.m4v *.gif)'
+MEDIA_FILTER = ('Photos and videos (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff '
+                '*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.gif)')
+
+
+def _bool(v) -> bool:
+    return v in (True, 'true', 'True', 1, '1')
 
 
 class Task(QThread):
@@ -57,8 +64,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.colors = colors
         self.setWindowTitle('Swapframe')
-        self.resize(1320, 840)
-        self.setMinimumSize(1000, 660)
+        self.resize(1320, 860)
+        self.setMinimumSize(1000, 680)
         self.store = QSettings('Swapframe', 'Swapframe')
 
         devices = available_devices()
@@ -81,6 +88,7 @@ class MainWindow(QMainWindow):
         self.preview_pending = False
         self.render_task: Optional[Task] = None
         self.comparing = False
+        self.last_output: Optional[str] = None
 
         self._build(devices)
         self._load_settings()
@@ -89,6 +97,12 @@ class MainWindow(QMainWindow):
         self.seek_timer = QTimer(self, singleShot=True, interval=180, timeout=self._seek)
 
     # ------------------------------------------------------------------ UI --
+    def _switch(self, text: str, tip: str) -> Switch:
+        sw = Switch(text, accent=self.colors['accent'], track=self.colors['track'])
+        sw.setToolTip(tip)
+        sw.toggled.connect(self._settings_changed)
+        return sw
+
     def _build(self, devices: List[str]):
         root = QWidget(objectName='root')
         self.setCentralWidget(root)
@@ -112,16 +126,14 @@ class MainWindow(QMainWindow):
         sp.setContentsMargins(0, 0, 0, 0)
         sp.addWidget(side_scroll)
 
-        title = QLabel('Swapframe', objectName='title')
-        side.addWidget(title)
+        side.addWidget(QLabel('Swapframe', objectName='title'))
         side.addSpacing(4)
 
         # source faces
         row = QHBoxLayout()
         row.addWidget(section('Face'))
         row.addStretch()
-        self.clear_src_btn = QPushButton('Clear', objectName='ghost', clicked=self._clear_sources)
-        row.addWidget(self.clear_src_btn)
+        row.addWidget(QPushButton('Clear', objectName='ghost', clicked=self._clear_sources))
         side.addLayout(row)
         self.src_drop = DropFrame()
         self.src_drop.files.connect(self._add_sources)
@@ -132,12 +144,11 @@ class MainWindow(QMainWindow):
         self.src_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.src_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.src_list.customContextMenuRequested.connect(self._source_menu)
-        self.src_hint = QLabel('Drop one or more clear photos of the face', objectName='hint')
+        self.src_hint = QLabel('Drop 2–5 clear photos of the face from a few angles', objectName='hint')
         self.src_hint.setWordWrap(True)
-        add_btn = QPushButton('Add photos', clicked=self._browse_sources)
         sd.addWidget(self.src_list)
         sd.addWidget(self.src_hint)
-        sd.addWidget(add_btn)
+        sd.addWidget(QPushButton('Add photos', clicked=self._browse_sources))
         side.addWidget(self.src_drop)
 
         # target
@@ -195,14 +206,16 @@ class MainWindow(QMainWindow):
         self.face_box.currentIndexChanged.connect(self._face_mode_changed)
         side.addWidget(self.face_box)
 
-        side.addSpacing(4)
-        self.occl_switch = Switch('Keep hands and hair in front', accent=self.colors['accent'],
-                                  track=self.colors['track'])
-        self.occl_switch.toggled.connect(self._settings_changed)
-        side.addWidget(self.occl_switch)
-        self.steady_switch = Switch('Steady video tracking', accent=self.colors['accent'], track=self.colors['track'])
-        self.steady_switch.setChecked(True)
-        side.addWidget(self.steady_switch)
+        # natural look
+        side.addSpacing(6)
+        side.addWidget(section('Natural look'))
+        self.shape_switch = self._switch('Follow face shape', 'Blend along the real face outline instead of a box')
+        self.tone_switch = self._switch('Match skin tone and lighting', 'Adapt the new face to the scene lighting')
+        self.lm_switch = self._switch('Precise alignment', '68-point landmarks for turned heads and expressions')
+        self.occl_switch = self._switch('Keep hands and hair in front', 'Objects covering the face stay on top')
+        self.steady_switch = self._switch('Steady video tracking', 'Smooth jitter and keep faces through head turns')
+        for sw in (self.shape_switch, self.tone_switch, self.lm_switch, self.occl_switch, self.steady_switch):
+            side.addWidget(sw)
 
         side.addSpacing(4)
         side.addWidget(section('Device'))
@@ -213,9 +226,9 @@ class MainWindow(QMainWindow):
         self.device_box.currentIndexChanged.connect(self._device_changed)
         side.addWidget(self.device_box)
         side.addStretch()
-        models_btn = QPushButton('Open models folder', objectName='ghost',
-                                 clicked=lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(models.models_dir())))
-        side.addWidget(models_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        side.addWidget(QPushButton('Open models folder', objectName='ghost',
+                                   clicked=lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(models.models_dir()))),
+                       alignment=Qt.AlignmentFlag.AlignLeft)
         outer.addWidget(side_panel)
 
         # ---- main area
@@ -229,7 +242,6 @@ class MainWindow(QMainWindow):
         self.preview.files.connect(self._preview_drop)
         main.addWidget(self.preview, 1)
 
-        # video scrub
         self.scrub = QWidget()
         sl = QHBoxLayout(self.scrub)
         sl.setContentsMargins(0, 0, 0, 0)
@@ -241,7 +253,6 @@ class MainWindow(QMainWindow):
         self.scrub.hide()
         main.addWidget(self.scrub)
 
-        # face picker strip
         self.strip = QWidget()
         stl = QVBoxLayout(self.strip)
         stl.setContentsMargins(0, 0, 0, 0)
@@ -254,7 +265,6 @@ class MainWindow(QMainWindow):
         self.strip.hide()
         main.addWidget(self.strip)
 
-        # action bar
         bar = QHBoxLayout()
         bar.setSpacing(10)
         self.compare_btn = QPushButton('Hold to compare')
@@ -278,19 +288,26 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.go_btn)
         main.addLayout(bar)
         outer.addWidget(main_panel, 1)
-        self.last_output: Optional[str] = None
 
     # ------------------------------------------------------------ settings --
     def _load_settings(self):
         s = self.store
-        idx = self.model_box.findData(s.value('swapper', 'hyperswap_1a_256'))
-        self.model_box.setCurrentIndex(max(0, idx))
+        widgets = (self.model_box, self.enh_box, self.enh_slider, self.shape_switch, self.tone_switch,
+                   self.lm_switch, self.occl_switch, self.steady_switch)
+        for w in widgets:
+            w.blockSignals(True)
+        self.model_box.setCurrentIndex(max(0, self.model_box.findData(s.value('swapper', 'alphaface_256'))))
         self.detail.set_index(int(s.value('detail', 1)))
-        idx = self.enh_box.findData(s.value('enhancer', None) or None)
-        self.enh_box.setCurrentIndex(max(0, idx))
+        self.enh_box.setCurrentIndex(max(0, self.enh_box.findData(s.value('enhancer', None) or None)))
         self.enh_slider.setValue(int(s.value('enhance_blend', 80)))
-        self.occl_switch.setChecked(s.value('occlusion', 'false') in (True, 'true'))
-        self.steady_switch.setChecked(s.value('stabilise', 'true') in (True, 'true'))
+        self.shape_switch.setChecked(_bool(s.value('face_shape', True)))
+        self.tone_switch.setChecked(_bool(s.value('colour_match', True)))
+        self.lm_switch.setChecked(_bool(s.value('landmarks', True)))
+        self.occl_switch.setChecked(_bool(s.value('occlusion', False)))
+        self.steady_switch.setChecked(_bool(s.value('stabilise', True)))
+        for w in widgets:
+            w.blockSignals(False)
+        self.enh_slider.setEnabled(self.enh_box.currentData() is not None)
 
     def _save_settings(self):
         s = self.store
@@ -298,6 +315,9 @@ class MainWindow(QMainWindow):
         s.setValue('detail', self.detail.index())
         s.setValue('enhancer', self.enh_box.currentData() or '')
         s.setValue('enhance_blend', self.enh_slider.value())
+        s.setValue('face_shape', self.shape_switch.isChecked())
+        s.setValue('colour_match', self.tone_switch.isChecked())
+        s.setValue('landmarks', self.lm_switch.isChecked())
         s.setValue('occlusion', self.occl_switch.isChecked())
         s.setValue('stabilise', self.steady_switch.isChecked())
         s.setValue('device', self.device_box.currentData())
@@ -309,6 +329,9 @@ class MainWindow(QMainWindow):
             enhancer=self.enh_box.currentData(),
             enhance_blend=self.enh_slider.value() / 100.0,
             occlusion=self.occl_switch.isChecked(),
+            face_shape=self.shape_switch.isChecked(),
+            landmarks=self.lm_switch.isChecked(),
+            colour_match=0.8 if self.tone_switch.isChecked() else 0.0,
             face_mode=self.face_box.currentData(),
             reference=list(self.references),
             stabilise=self.steady_switch.isChecked(),
@@ -375,7 +398,7 @@ class MainWindow(QMainWindow):
         self.source_paths.clear()
         self.source_faces.clear()
         self.src_list.clear()
-        self.src_hint.setText('Drop one or more clear photos of the face')
+        self.src_hint.setText('Drop 2–5 clear photos of the face from a few angles')
         self.result = None
         self._show_frame()
         self._update_actions()
@@ -686,7 +709,6 @@ class MainWindow(QMainWindow):
         self.progress.show()
 
         def job(task: Task):
-            import time
             self.pipeline.prepare(settings, task.progress.emit, task.cancelled)
             self.pipeline.reset_tracking()
             writer = media.VideoWriter(path, src, info)
@@ -752,7 +774,8 @@ class MainWindow(QMainWindow):
 
     def _set_controls_enabled(self, on: bool):
         for w in (self.src_drop, self.tgt_drop, self.model_box, self.detail, self.enh_box, self.enh_slider,
-                  self.face_box, self.occl_switch, self.steady_switch, self.device_box, self.scrub, self.strip):
+                  self.face_box, self.shape_switch, self.tone_switch, self.lm_switch, self.occl_switch,
+                  self.steady_switch, self.device_box, self.scrub, self.strip):
             w.setEnabled(on)
         self.preview.setAcceptDrops(on)
 
@@ -777,11 +800,10 @@ class MainWindow(QMainWindow):
 
 def _face_crop(img: np.ndarray, face: Face, pad: float = 0.35) -> np.ndarray:
     x1, y1, x2, y2 = face.bbox
-    w, h = x2 - x1, y2 - y1
-    side = max(w, h) * (1 + pad)
+    side = max(x2 - x1, y2 - y1) * (1 + pad)
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-    H, W = img.shape[:2]
+    h, w = img.shape[:2]
     a, b = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
-    c, d = int(min(W, cx + side / 2)), int(min(H, cy + side / 2))
+    c, d = int(min(w, cx + side / 2)), int(min(h, cy + side / 2))
     crop = img[b:d, a:c]
     return crop if crop.size else img

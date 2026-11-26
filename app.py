@@ -3,7 +3,7 @@ import os
 import sys
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontDatabase, QGuiApplication, QIcon, QPalette, QColor
+from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from swapframe import __version__
@@ -28,7 +28,7 @@ def load_font() -> str:
                     family = fams[0]
     if family:
         return family
-    return {'win32': 'Segoe UI', 'darwin': '.AppleSystemUIFont'}.get(sys.platform, 'Sans Serif')
+    return 'Segoe UI' if sys.platform == 'win32' else 'Sans Serif'
 
 
 def is_dark(app: QApplication) -> bool:
@@ -80,11 +80,11 @@ def main() -> int:
     win = MainWindow(colors, family)
     win.show()
 
-    if smoke:  # CI: prove the bundle starts (Qt + onnxruntime + ffmpeg), then quit
+    if smoke:  # CI: prove the bundle starts (Qt + onnxruntime + onnx + ffmpeg), then quit
         from PySide6.QtCore import QTimer
+        import onnx  # noqa: F401
         from swapframe import media
         from swapframe.engine import available_devices
-        import onnx  # noqa: F401  (needed for InSwapper)
         ok = os.path.exists(media.ffmpeg_exe())
         print('devices:', available_devices(), 'ffmpeg:', ok, flush=True)
         QTimer.singleShot(2000, lambda: app.exit(0 if ok else 1))

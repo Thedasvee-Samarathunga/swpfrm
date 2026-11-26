@@ -31,10 +31,12 @@ class ModelInfo:
 
 
 MODELS: dict[str, ModelInfo] = {m.key: m for m in [
-    # core
+    # analysis
     ModelInfo('retinaface_10g', 'models-3.0.0', 'retinaface_10g.onnx', 'Face detector'),
     ModelInfo('arcface_w600k_r50', 'models-3.0.0', 'arcface_w600k_r50.onnx', 'Face recogniser'),
+    ModelInfo('2dfan4', 'models-3.0.0', '2dfan4.onnx', 'Landmark model'),
     # swappers
+    ModelInfo('alphaface_256', 'models-3.9.0', 'alphaface_256.onnx', 'AlphaFace'),
     ModelInfo('hyperswap_1a_256', 'models-3.3.0', 'hyperswap_1a_256.onnx', 'HyperSwap 1A'),
     ModelInfo('hyperswap_1b_256', 'models-3.3.0', 'hyperswap_1b_256.onnx', 'HyperSwap 1B'),
     ModelInfo('hyperswap_1c_256', 'models-3.3.0', 'hyperswap_1c_256.onnx', 'HyperSwap 1C'),
@@ -44,6 +46,7 @@ MODELS: dict[str, ModelInfo] = {m.key: m for m in [
     ModelInfo('gpen_bfr_512', 'models-3.0.0', 'gpen_bfr_512.onnx', 'GPEN 512'),
     # masks
     ModelInfo('xseg_1', 'models-3.1.0', 'xseg_1.onnx', 'Occlusion mask'),
+    ModelInfo('bisenet_resnet_34', 'models-3.0.0', 'bisenet_resnet_34.onnx', 'Face shape mask'),
 ]}
 
 MIRRORS = [
@@ -58,8 +61,6 @@ def models_dir() -> str:
         path = override
     elif os.name == 'nt':
         path = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'Swapframe', 'models')
-    elif os.uname().sysname == 'Darwin':
-        path = os.path.expanduser('~/Library/Application Support/Swapframe/models')
     else:
         path = os.path.join(os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')), 'swapframe', 'models')
     os.makedirs(path, exist_ok=True)
@@ -75,7 +76,7 @@ def is_downloaded(key: str) -> bool:
 
 
 def _open(url: str, timeout: int = 30):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Swapframe/1.0'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'Swapframe/1.1'})
     return urllib.request.urlopen(req, timeout=timeout, context=_SSL)
 
 

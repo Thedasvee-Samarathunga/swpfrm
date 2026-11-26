@@ -4,6 +4,5 @@ onnx>=1.16
 PySide6-Essentials>=6.7
 imageio-ffmpeg>=0.5
 certifi
-# runtime (pick one per platform)
 onnxruntime-directml>=1.19 ; sys_platform == "win32"
 onnxruntime>=1.19 ; sys_platform != "win32"

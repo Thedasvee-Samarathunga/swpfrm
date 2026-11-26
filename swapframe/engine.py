@@ -1,13 +1,18 @@
-"""Face swap engine: detection, recognition, swapping, masking, enhancement.
+"""Face swap engine: detection, landmarks, recognition, swapping, masking, colour, enhancement.
 
-Pre/post-processing mirrors FaceFusion's reference implementation so the
-HyperSwap / InSwapper / GFPGAN / GPEN ONNX models behave as intended.
+Pre/post-processing mirrors FaceFusion's reference implementation for the
+HyperSwap / InSwapper / GFPGAN / GPEN / XSeg / BiSeNet / 2DFAN4 ONNX models.
+AlphaFace's input conventions are detected automatically the first time it is
+used (see ``calibrate``) and cached, so the app adapts to the exported model.
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence
+from itertools import product
+from typing import List, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -86,6 +91,23 @@ def explode_pixel_boost(tiles: Sequence[np.ndarray], total: int, size: int) -> n
     return crop.transpose(2, 0, 3, 1, 4).reshape(size * total, size * total, 3)
 
 
+def match_colour(swapped: np.ndarray, target: np.ndarray, mask: np.ndarray, strength: float = 1.0) -> np.ndarray:
+    """Shift the swapped face's skin tone / lighting toward the original face (LAB statistics inside ``mask``)."""
+    weight = mask > 0.5
+    if weight.sum() < 64 or strength <= 0:
+        return swapped
+    src = cv2.cvtColor(swapped.clip(0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    ref = cv2.cvtColor(target.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    s, r = src[weight], ref[weight]
+    s_mean, s_std = s.mean(0), s.std(0) + 1e-3
+    r_mean, r_std = r.mean(0), r.std(0) + 1e-3
+    ratio = np.clip(r_std / s_std, 0.75, 1.33)
+    ratio[1:] = 1.0  # keep the source face's own chroma contrast; only match tone + lighting contrast
+    out = (src - s_mean) * ratio + r_mean
+    out = src + (out - src) * float(strength)
+    return cv2.cvtColor(out.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+
+
 # --------------------------------------------------------------------------- #
 # Runtime
 # --------------------------------------------------------------------------- #
@@ -96,14 +118,11 @@ def available_devices() -> List[str]:
         devices.append('CUDA')
     if 'DmlExecutionProvider' in providers:
         devices.append('DirectML')
-    if 'CoreMLExecutionProvider' in providers:
-        devices.append('CoreML')
     devices.append('CPU')
     return devices
 
 
-_PROVIDER = {'CUDA': 'CUDAExecutionProvider', 'DirectML': 'DmlExecutionProvider',
-             'CoreML': 'CoreMLExecutionProvider', 'CPU': 'CPUExecutionProvider'}
+_PROVIDER = {'CUDA': 'CUDAExecutionProvider', 'DirectML': 'DmlExecutionProvider', 'CPU': 'CPUExecutionProvider'}
 
 
 def create_session(path: str, device: str) -> ort.InferenceSession:
@@ -136,6 +155,7 @@ class Face:
     score: float
     embedding: Optional[np.ndarray] = None   # raw arcface embedding (512,)
     normed: Optional[np.ndarray] = None      # L2-normalised embedding
+    landmarks68: Optional[np.ndarray] = None
 
     @property
     def area(self) -> float:
@@ -201,6 +221,80 @@ class Detector:
         faces.sort(key=lambda f: (f.bbox[0], f.bbox[1]))
         return faces
 
+    def detect_rotated(self, frame: np.ndarray, threshold: float) -> List[Face]:
+        """Retry on 90/270/180 degree rotations (lying down, upside-down, sideways phone shots)."""
+        h, w = frame.shape[:2]
+        for code in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
+            faces = self.detect(cv2.rotate(frame, code), threshold)
+            if not faces:
+                continue
+            for f in faces:
+                f.kps = _unrotate(f.kps, code, w, h)
+                pts = _unrotate(f.bbox.reshape(2, 2), code, w, h)
+                f.bbox = np.concatenate([pts.min(0), pts.max(0)])
+            return faces
+        return []
+
+    def detect_region(self, frame: np.ndarray, bbox: np.ndarray, threshold: float) -> List[Face]:
+        """Zoomed re-detection around where a face was last seen (recovers turned / small faces)."""
+        h, w = frame.shape[:2]
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        side = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * 2.2
+        x0, y0 = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
+        x1, y1 = int(min(w, cx + side / 2)), int(min(h, cy + side / 2))
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            return []
+        faces = self.detect(frame[y0:y1, x0:x1], threshold)
+        for f in faces:
+            f.bbox = f.bbox + [x0, y0, x0, y0]
+            f.kps = f.kps + [x0, y0]
+        return faces
+
+
+def _unrotate(pts: np.ndarray, code: int, w: int, h: int) -> np.ndarray:
+    x, y = pts[:, 0], pts[:, 1]
+    if code == cv2.ROTATE_90_CLOCKWISE:        # rotated (h x w): x' = h-1-y, y' = x
+        return np.stack([y, h - 1 - x], axis=1)
+    if code == cv2.ROTATE_90_COUNTERCLOCKWISE:  # x' = y, y' = w-1-x
+        return np.stack([w - 1 - y, x], axis=1)
+    return np.stack([w - 1 - x, h - 1 - y], axis=1)
+
+
+class Landmarker:
+    """2DFAN4 68-point landmarks -> refined 5-point alignment (much steadier on turned heads + expressions)."""
+
+    def __init__(self, session: ort.InferenceSession):
+        self.session = session
+        self.input_name = session.get_inputs()[0].name
+
+    def refine(self, frame: np.ndarray, face: Face) -> Face:
+        bbox = face.bbox
+        scale = 195.0 / max(bbox[2] - bbox[0], bbox[3] - bbox[1], 1.0)
+        tx, ty = (256 - (bbox[2:] + bbox[:2]) * scale) * 0.5
+        matrix = np.array([[scale, 0, tx], [0, scale, ty]], np.float32)
+        crop = cv2.warpAffine(frame, matrix, (256, 256))
+        lab = cv2.cvtColor(crop, cv2.COLOR_RGB2Lab)
+        if lab[:, :, 0].mean() < 30:  # dark shots: equalise so landmarks still lock on
+            lab[:, :, 0] = cv2.createCLAHE(clipLimit=2).apply(lab[:, :, 0])
+            crop = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
+        x = crop.transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        outs = self.session.run(None, {self.input_name: x})
+        coords = next(o for o in outs if o.ndim == 3)
+        heat = next((o for o in outs if o.ndim == 4), None)
+        pts = coords[0, :, :2] / 64.0 * 256.0
+        inv = cv2.invertAffineTransform(matrix)
+        pts = pts @ inv[:, :2].T + inv[:, 2]
+        confidence = float(np.interp(heat.max(axis=(2, 3)).mean(), [0, 0.9], [0, 1])) if heat is not None else 1.0
+        if confidence < 0.5:
+            return face
+        kps5 = np.stack([pts[36:42].mean(0), pts[42:48].mean(0), pts[30], pts[48], pts[54]]).astype(np.float32)
+        size = max(bbox[2] - bbox[0], 1.0)
+        if np.abs(kps5 - face.kps).mean() / size > 0.12:  # disagree badly -> trust the detector
+            return face
+        face.kps = kps5
+        face.landmarks68 = pts.astype(np.float32)
+        return face
+
 
 class Recogniser:
     def __init__(self, session: ort.InferenceSession):
@@ -217,54 +311,61 @@ class Recogniser:
 
 
 @dataclass(frozen=True)
-class SwapperSpec:
-    key: str
-    kind: str          # 'hyperswap' | 'inswapper'
+class SwapConfig:
     template: str
-    size: int
     mean: tuple
     std: tuple
+    embed: str          # 'normed' | 'emap'
 
 
-SWAPPERS = {
-    'hyperswap_1a_256': SwapperSpec('hyperswap_1a_256', 'hyperswap', 'arcface_128', 256, (0.5,) * 3, (0.5,) * 3),
-    'hyperswap_1b_256': SwapperSpec('hyperswap_1b_256', 'hyperswap', 'arcface_128', 256, (0.5,) * 3, (0.5,) * 3),
-    'hyperswap_1c_256': SwapperSpec('hyperswap_1c_256', 'hyperswap', 'arcface_128', 256, (0.5,) * 3, (0.5,) * 3),
-    'inswapper_128_fp16': SwapperSpec('inswapper_128_fp16', 'inswapper', 'arcface_128', 128, (0.0,) * 3, (1.0,) * 3),
+KNOWN = {
+    'hyperswap_1a_256': SwapConfig('arcface_128', (0.5,) * 3, (0.5,) * 3, 'normed'),
+    'hyperswap_1b_256': SwapConfig('arcface_128', (0.5,) * 3, (0.5,) * 3, 'normed'),
+    'hyperswap_1c_256': SwapConfig('arcface_128', (0.5,) * 3, (0.5,) * 3, 'normed'),
+    'inswapper_128_fp16': SwapConfig('arcface_128', (0.0,) * 3, (1.0,) * 3, 'emap'),
 }
+AUTO = {'alphaface_256'}  # conventions detected on first use
+SWAPPER_KEYS = list(KNOWN) + sorted(AUTO)
 
 
-def load_inswapper_emap(path: str) -> np.ndarray:
+def find_emap(path: str) -> Optional[np.ndarray]:
+    """Embedding projection matrix stored as the last 512x512 initializer (InSwapper / AlphaFace style)."""
     import onnx
     from onnx import numpy_helper
-    graph = onnx.load(path).graph
-    return numpy_helper.to_array(graph.initializer[-1]).astype(np.float32)
+    graph = onnx.load(path, load_external_data=False).graph
+    for init in reversed(graph.initializer):
+        if list(init.dims) == [512, 512]:
+            return numpy_helper.to_array(init).astype(np.float32)
+    return None
 
 
 class Swapper:
-    def __init__(self, session: ort.InferenceSession, spec: SwapperSpec, emap: Optional[np.ndarray] = None):
+    def __init__(self, session: ort.InferenceSession, config: SwapConfig, emap: Optional[np.ndarray] = None):
         self.session = session
-        self.spec = spec
+        self.config = config
         self.emap = emap
-        self.mean = np.array(spec.mean, np.float32)
-        self.std = np.array(spec.std, np.float32)
+        self.mean = np.array(config.mean, np.float32)
+        self.std = np.array(config.std, np.float32)
         self.image_input = self.embed_input = None
+        self.size = 256
         for inp in session.get_inputs():
             if len(inp.shape) == 4:
                 self.image_input = (inp.name, _np_dtype(inp.type))
+                if isinstance(inp.shape[2], int):
+                    self.size = inp.shape[2]
             else:
                 self.embed_input = (inp.name, _np_dtype(inp.type))
         outputs = session.get_outputs()
         self.output_name = outputs[0].name
-        for out in outputs:  # HyperSwap also exports a mask; pick the RGB output
+        for out in outputs:  # some swappers also export a mask; pick the RGB output
             if len(out.shape) == 4 and out.shape[1] == 3:
                 self.output_name = out.name
                 break
 
     def source_embedding(self, faces: Sequence[Face]) -> np.ndarray:
-        if self.spec.kind == 'inswapper':
+        if self.config.embed == 'emap' and self.emap is not None:
             raw = np.mean([f.embedding for f in faces], axis=0).reshape(1, -1)
-            return (raw @ self.emap) / np.linalg.norm(raw)
+            return (raw @ self.emap) / (np.linalg.norm(raw) + 1e-8)
         normed = np.mean([f.normed for f in faces], axis=0)
         return (normed / (np.linalg.norm(normed) + 1e-8)).reshape(1, -1)
 
@@ -278,12 +379,11 @@ class Swapper:
         return out[:, :, ::-1] * 255.0
 
     def swap_crop(self, crop: np.ndarray, embedding: np.ndarray) -> np.ndarray:
-        size = self.spec.size
-        total = crop.shape[0] // size
+        total = crop.shape[0] // self.size
         if total <= 1:
             return self._run(crop, embedding)
-        tiles = implode_pixel_boost(crop, total, size)
-        return explode_pixel_boost([self._run(t, embedding) for t in tiles], total, size)
+        tiles = implode_pixel_boost(crop, total, self.size)
+        return explode_pixel_boost([self._run(t, embedding) for t in tiles], total, self.size)
 
 
 class Occluder:
@@ -304,6 +404,27 @@ class Occluder:
         return (cv2.GaussianBlur(out.clip(0, 1), (0, 0), 5).clip(0.5, 1) - 0.5) * 2
 
 
+class FaceParser:
+    """BiSeNet face parsing -> soft mask that follows the real face outline (no box edges on turned heads)."""
+    REGIONS = [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]  # skin, brows, eyes, glasses, nose, mouth, lips
+    MEAN = np.array([0.485, 0.456, 0.406], np.float32)
+    STD = np.array([0.229, 0.224, 0.225], np.float32)
+
+    def __init__(self, session: ort.InferenceSession):
+        self.session = session
+        self.input_name = session.get_inputs()[0].name
+
+    def mask(self, crop: np.ndarray) -> np.ndarray:
+        x = cv2.resize(crop, (512, 512))[:, :, ::-1].astype(np.float32) / 255.0
+        x = ((x - self.MEAN) / self.STD).transpose(2, 0, 1)[None]
+        out = self.session.run(None, {self.input_name: x})[0][0]
+        region = np.isin(out.argmax(0), self.REGIONS).astype(np.float32)
+        # grow slightly so the jawline / forehead blend instead of cutting hard
+        region = cv2.dilate(region, np.ones((9, 9), np.uint8))
+        region = cv2.resize(region, crop.shape[:2][::-1])
+        return (cv2.GaussianBlur(region.clip(0, 1), (0, 0), 5).clip(0.5, 1) - 0.5) * 2
+
+
 class Enhancer:
     """GFPGAN / GPEN face restoration on an FFHQ-aligned 512 crop."""
 
@@ -322,15 +443,69 @@ class Enhancer:
 
 
 # --------------------------------------------------------------------------- #
+# Auto-calibration for models whose I/O conventions aren't hard-coded
+# --------------------------------------------------------------------------- #
+def _calibration_file() -> str:
+    return os.path.join(models.models_dir(), 'calibration.json')
+
+
+def _load_calibration() -> dict:
+    try:
+        with open(_calibration_file(), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_calibration(data: dict) -> None:
+    try:
+        with open(_calibration_file(), 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def calibrate(session, emap, frame: np.ndarray, target: Face, source: Sequence[Face],
+              recogniser: Recogniser) -> SwapConfig:
+    """Try every plausible convention and keep the one that best (a) carries the source identity and
+    (b) keeps the target's lighting/colour. Wrong conventions fail one of the two very obviously."""
+    best, best_score = None, -1e9
+    embeds = ['normed'] + (['emap'] if emap is not None else [])
+    for template, norm, embed in product(('arcface_128', 'ffhq_512'), ((0.5, 0.5), (0.0, 1.0)), embeds):
+        cfg = SwapConfig(template, (norm[0],) * 3, (norm[1],) * 3, embed)
+        sw = Swapper(session, cfg, emap)
+        try:
+            crop, matrix = warp_face(frame, target.kps, template, sw.size)
+            out = sw.swap_crop(crop, sw.source_embedding(source))
+        except Exception:
+            continue
+        if not np.isfinite(out).all():
+            continue
+        inner = box_mask(sw.size, 0.3) > 0.5
+        colour_err = float(np.abs(cv2.blur(out, (15, 15)) - cv2.blur(crop.astype(np.float32), (15, 15)))[inner].mean()) / 255
+        test = paste_back(frame.copy(), out, box_mask(sw.size, 0.3), matrix)
+        probe = Face(target.bbox.copy(), target.kps.copy(), target.score)
+        recogniser.embed(test, probe)
+        identity = float(np.mean([probe.normed @ s.normed for s in source]))
+        score = identity - 1.5 * colour_err
+        if score > best_score:
+            best, best_score = cfg, score
+    return best or SwapConfig('arcface_128', (0.5,) * 3, (0.5,) * 3, 'normed')
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
 @dataclass
 class Settings:
-    swapper: str = 'hyperswap_1a_256'
+    swapper: str = 'alphaface_256'
     boost: int = 2                      # pixel boost multiplier (1, 2, 4)
     enhancer: Optional[str] = None      # 'gfpgan_1.4' | 'gpen_bfr_512' | None
     enhance_blend: float = 0.8
     occlusion: bool = False
+    face_shape: bool = True             # BiSeNet face-outline mask
+    landmarks: bool = True              # 68-point alignment
+    colour_match: float = 0.8           # 0 = off
     mask_blur: float = 0.3
     mask_padding: tuple = (0, 0, 0, 0)
     face_mode: str = 'all'              # 'all' | 'selected' | 'largest'
@@ -340,14 +515,21 @@ class Settings:
     stabilise: bool = True
 
 
+@dataclass
+class _Track:
+    face: Face
+    misses: int = 0
+
+
 class Pipeline:
     def __init__(self, device: str = 'CPU'):
         self.device = device
         self.lock = threading.RLock()
-        self._sessions: dict[str, ort.InferenceSession] = {}
-        self._emaps: dict[str, np.ndarray] = {}
+        self._sessions: dict = {}
+        self._emaps: dict = {}
+        self._configs: dict = {}
         self._mask_cache: dict = {}
-        self._track: List[Face] = []
+        self._tracks: List[_Track] = []
 
     # -- model management -------------------------------------------------- #
     def set_device(self, device: str) -> None:
@@ -356,37 +538,57 @@ class Pipeline:
                 self.device = device
                 self._sessions.clear()
 
-    def _session(self, key: str, progress=None, cancelled=lambda: False) -> ort.InferenceSession:
+    def _session(self, key: str, progress=None, cancelled=lambda: False):
         if key not in self._sessions:
             path = models.ensure(key, progress, cancelled)
-            device = self.device
-            # HyperSwap / XSeg are not CoreML friendly; keep them on CPU on macOS.
-            if device == 'CoreML' and key.startswith(('hyperswap', 'xseg', 'inswapper')):
-                device = 'CPU'
-            self._sessions[key] = create_session(path, device)
+            self._sessions[key] = create_session(path, self.device)
         return self._sessions[key]
+
+    def prepare_core(self, progress=None, cancelled=lambda: False) -> None:
+        with self.lock:
+            for key in ('retinaface_10g', 'arcface_w600k_r50', '2dfan4'):
+                self._session(key, progress, cancelled)
 
     def prepare(self, settings: Settings, progress=None, cancelled=lambda: False) -> None:
         """Download + load every model the given settings need."""
         with self.lock:
             for key in self.required_models(settings):
                 self._session(key, progress, cancelled)
-            if SWAPPERS[settings.swapper].kind == 'inswapper' and settings.swapper not in self._emaps:
-                self._emaps[settings.swapper] = load_inswapper_emap(models.model_path(settings.swapper))
-
-    def prepare_core(self, progress=None, cancelled=lambda: False) -> None:
-        with self.lock:
-            for key in ('retinaface_10g', 'arcface_w600k_r50'):
-                self._session(key, progress, cancelled)
+            key = settings.swapper
+            if key not in self._emaps:
+                needs = key in AUTO or KNOWN.get(key, KNOWN['hyperswap_1a_256']).embed == 'emap'
+                self._emaps[key] = find_emap(models.model_path(key)) if needs and models.is_downloaded(key) else None
 
     @staticmethod
     def required_models(settings: Settings) -> List[str]:
         keys = ['retinaface_10g', 'arcface_w600k_r50', settings.swapper]
+        if settings.landmarks:
+            keys.append('2dfan4')
         if settings.enhancer:
             keys.append(settings.enhancer)
         if settings.occlusion:
             keys.append('xseg_1')
+        if settings.face_shape:
+            keys.append('bisenet_resnet_34')
         return keys
+
+    def _config(self, key: str, frame: np.ndarray, target: Face, source: Sequence[Face]) -> SwapConfig:
+        if key in KNOWN:
+            return KNOWN[key]
+        if key in self._configs:
+            return self._configs[key]
+        stamp = str(os.path.getsize(models.model_path(key))) if models.is_downloaded(key) else 'mem'
+        cache = _load_calibration()
+        hit = cache.get(key)
+        if hit and hit.get('stamp') == stamp:
+            cfg = SwapConfig(hit['template'], tuple(hit['mean']), tuple(hit['std']), hit['embed'])
+        else:
+            cfg = calibrate(self._sessions[key], self._emaps.get(key), frame, target, source, self.recogniser)
+            cache[key] = dict(stamp=stamp, template=cfg.template, mean=list(cfg.mean), std=list(cfg.std),
+                              embed=cfg.embed)
+            _save_calibration(cache)
+        self._configs[key] = cfg
+        return cfg
 
     @property
     def detector(self) -> Detector:
@@ -397,14 +599,28 @@ class Pipeline:
         return Recogniser(self._session('arcface_w600k_r50'))
 
     # -- analysis ---------------------------------------------------------- #
-    def analyse(self, frame: np.ndarray, threshold: float = 0.5, embed: bool = True) -> List[Face]:
+    def analyse(self, frame: np.ndarray, threshold: float = 0.5, embed: bool = True,
+                landmarks: bool = True, rotate: bool = True) -> List[Face]:
         with self.lock:
-            faces = self.detector.detect(frame, threshold)
-            if embed:
-                rec = self.recogniser
-                for f in faces:
-                    rec.embed(frame, f)
+            det = self.detector
+            faces = det.detect(frame, threshold)
+            if not faces and rotate:
+                faces = det.detect_rotated(frame, threshold)
+            self._finish(frame, faces, embed, landmarks)
             return faces
+
+    def _finish(self, frame, faces, embed, landmarks):
+        if landmarks:
+            try:
+                lm = Landmarker(self._session('2dfan4'))
+                for f in faces:
+                    lm.refine(frame, f)
+            except Exception:
+                pass
+        if embed:
+            rec = self.recogniser
+            for f in faces:
+                rec.embed(frame, f)
 
     def source_faces(self, images: Sequence[np.ndarray]) -> List[Face]:
         """Largest face from each source image."""
@@ -416,22 +632,44 @@ class Pipeline:
         return result
 
     def reset_tracking(self) -> None:
-        self._track = []
+        self._tracks = []
 
-    def _stabilise(self, faces: List[Face]) -> None:
-        prev = self._track
+    def _track(self, frame: np.ndarray, faces: List[Face], settings: Settings) -> List[Face]:
+        """Smooth landmarks between frames and recover faces the detector briefly loses (head turns, blur)."""
+        matched = set()
         for f in faces:
             best, best_iou = None, 0.0
-            for p in prev:
-                iou = _iou(f.bbox, p.bbox)
-                if iou > best_iou:
-                    best, best_iou = p, iou
-            if best is not None and best_iou > 0.5:
-                size = max(f.bbox[2] - f.bbox[0], 1.0)
-                motion = np.abs(f.kps - best.kps).mean() / size
-                alpha = float(np.clip(0.35 + motion * 12, 0.35, 1.0))  # move fast -> follow fast
-                f.kps = alpha * f.kps + (1 - alpha) * best.kps
-        self._track = [Face(f.bbox.copy(), f.kps.copy(), f.score) for f in faces]
+            for i, t in enumerate(self._tracks):
+                iou = _iou(f.bbox, t.face.bbox)
+                if iou > best_iou and i not in matched:
+                    best, best_iou = i, iou
+            if best is not None and best_iou > 0.3:
+                matched.add(best)
+                if settings.stabilise:
+                    prev = self._tracks[best].face
+                    size = max(f.bbox[2] - f.bbox[0], 1.0)
+                    motion = np.abs(f.kps - prev.kps).mean() / size
+                    alpha = float(np.clip(0.35 + motion * 12, 0.35, 1.0))  # fast motion -> follow fast
+                    f.kps = alpha * f.kps + (1 - alpha) * prev.kps
+        recovered = []
+        det = self.detector
+        for i, t in enumerate(self._tracks):
+            if i in matched or t.misses >= 6:
+                continue
+            found = det.detect_region(frame, t.face.bbox, max(0.25, settings.detect_threshold - 0.25))
+            found = [g for g in found if _iou(g.bbox, t.face.bbox) > 0.15]
+            if found:
+                g = max(found, key=lambda g: _iou(g.bbox, t.face.bbox))
+                self._finish(frame, [g], embed=False, landmarks=settings.landmarks)
+                g.normed = t.face.normed
+                recovered.append(g)
+        new_tracks = [_Track(_copy(f)) for f in faces + recovered]
+        for i, t in enumerate(self._tracks):
+            if i not in matched and not any(_iou(r.bbox, t.face.bbox) > 0.15 for r in recovered):
+                if t.misses < 6:
+                    new_tracks.append(_Track(t.face, t.misses + 1))
+        self._tracks = new_tracks
+        return faces + recovered
 
     # -- processing -------------------------------------------------------- #
     def _crop_mask(self, size: int, settings: Settings) -> np.ndarray:
@@ -446,27 +684,36 @@ class Pipeline:
         if not source:
             return frame
         with self.lock:
-            spec = SWAPPERS[settings.swapper]
-            swapper = Swapper(self._session(settings.swapper), spec, self._emaps.get(settings.swapper))
+            need_identity = settings.face_mode == 'selected' and settings.reference
+            faces = self.analyse(frame, settings.detect_threshold, embed=bool(need_identity),
+                                 landmarks=settings.landmarks, rotate=not video)
+            if video:
+                faces = self._track(frame, faces, settings)
+            faces = self._select(faces, settings)
+            if not faces:
+                return frame
+
+            key = settings.swapper
+            cfg = self._config(key, frame, max(faces, key=lambda f: f.area), source)
+            swapper = Swapper(self._session(key), cfg, self._emaps.get(key))
             embedding = swapper.source_embedding(source)
             occluder = Occluder(self._session('xseg_1')) if settings.occlusion else None
+            parser = FaceParser(self._session('bisenet_resnet_34')) if settings.face_shape else None
             enhancer = Enhancer(self._session(settings.enhancer)) if settings.enhancer else None
 
-            need_identity = settings.face_mode == 'selected' and settings.reference
-            faces = self.analyse(frame, settings.detect_threshold, embed=bool(need_identity))
-            if video and settings.stabilise:
-                self._stabilise(faces)
-            faces = self._select(faces, settings)
-
             out = frame.copy()
-            crop_size = spec.size * max(1, int(settings.boost))
+            crop_size = swapper.size * max(1, int(settings.boost))
             base_mask = self._crop_mask(crop_size, settings)
             for face in faces:
-                crop, matrix = warp_face(out, face.kps, spec.template, crop_size)
+                crop, matrix = warp_face(out, face.kps, cfg.template, crop_size)
                 mask = base_mask
+                if parser is not None:
+                    mask = np.minimum(mask, parser.mask(crop))
                 if occluder is not None:
                     mask = np.minimum(mask, occluder.mask(crop))
                 swapped = swapper.swap_crop(crop, embedding)
+                if settings.colour_match > 0:
+                    swapped = match_colour(swapped, crop, mask, settings.colour_match)
                 paste_back(out, swapped, mask, matrix)
                 if enhancer is not None:
                     enhancer.enhance(out, face, settings.enhance_blend)
@@ -482,15 +729,13 @@ class Pipeline:
             if not settings.reference:
                 return []
             refs = np.stack(settings.reference)
-            picked = []
-            for f in faces:
-                if f.normed is None:
-                    continue
-                distance = 1.0 - float(np.max(refs @ f.normed))
-                if distance < settings.match_distance:
-                    picked.append(f)
-            return picked
+            return [f for f in faces
+                    if f.normed is not None and 1.0 - float(np.max(refs @ f.normed)) < settings.match_distance]
         return faces
+
+
+def _copy(f: Face) -> Face:
+    return Face(f.bbox.copy(), f.kps.copy(), f.score, normed=f.normed)
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -499,6 +744,3 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
     inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
     union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     return float(inter / union) if union > 0 else 0.0
-
-
-ProgressFn = Callable[[str, int, int], None]
